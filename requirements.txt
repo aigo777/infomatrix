@@ -1,0 +1,7 @@
+opencv-python==4.9.0.80
+mediapipe==0.10.9
+numpy==1.26.4
+filterpy==1.4.5
+pyautogui==0.9.54
+PyQt5==5.15.10
+scipy==1.13.0
