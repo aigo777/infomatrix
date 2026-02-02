@@ -1,5 +1,4 @@
 from __future__ import annotations
-a=0
 import json
 import math
 import os
@@ -58,9 +57,21 @@ class OneEuroFilter:
 
 
 class OneEuroFilter2D:
-    def __init__(self, min_cutoff: float = 0.8, beta: float = 0.02, d_cutoff: float = 1.0) -> None:
+    def __init__(
+        self,
+        min_cutoff: float = 0.8,
+        beta: float = 0.02,
+        d_cutoff: float = 1.0,
+        min_cutoff_y: Optional[float] = None,
+        beta_y: Optional[float] = None,
+    ) -> None:
+        # Y gets a slightly higher cutoff/beta to keep vertical motion responsive.
+        if min_cutoff_y is None:
+            min_cutoff_y = min_cutoff * 1.35
+        if beta_y is None:
+            beta_y = beta * 1.5
         self.fx = OneEuroFilter(min_cutoff=min_cutoff, beta=beta, d_cutoff=d_cutoff)
-        self.fy = OneEuroFilter(min_cutoff=min_cutoff, beta=beta, d_cutoff=d_cutoff)
+        self.fy = OneEuroFilter(min_cutoff=min_cutoff_y, beta=beta_y, d_cutoff=d_cutoff)
         self.last_alpha = 0.0
         self.last_cutoff = 0.0
         self.last_velocity = 0.0
@@ -125,6 +136,7 @@ class GazeTracker:
         self.invert_x = invert_x
         self.invert_y = invert_y
         self.vertical_gain = 1.6
+        self._vertical_gain_base = self.vertical_gain
         self.deadzone = 0.03
         self.gamma = 0.7
         self.axis_flip_x = False
@@ -138,9 +150,9 @@ class GazeTracker:
         self._edge_hold_frames = 6
         self._edge_threshold = 0.08
         self._edge_pad_x = 0.06
-        self._edge_pad_y = 0.04
+        self._edge_pad_y = 0.02
         self._edge_overshoot_x = 0.05
-        self._edge_overshoot_y = 0.04
+        self._edge_overshoot_y = 0.06
         self._soft_pad = 0.06
         self._soft_k = 0.35
         self._min_span = 0.04
@@ -156,7 +168,13 @@ class GazeTracker:
         self._last_velocity = 0.0
         self._last_alpha = self.ema_alpha
         self._last_cutoff = 0.0
-        self._one_euro = OneEuroFilter2D(min_cutoff=0.8, beta=0.02, d_cutoff=1.0)
+        self._one_euro = OneEuroFilter2D(
+            min_cutoff=0.8,
+            beta=0.02,
+            d_cutoff=1.0,
+            min_cutoff_y=1.1,
+            beta_y=0.04,
+        )
         self._calib_quality: Dict[str, Dict[str, float]] = {}
         self._last_openness: Optional[float] = None
         self._open_ref: Optional[float] = None
@@ -414,6 +432,7 @@ class GazeTracker:
         self._calib_range = None
         self.axis_flip_x = False
         self.axis_flip_y = False
+        self.vertical_gain = self._vertical_gain_base
         self._map_x = None
         self._map_y = None
         self._map_spans = None
@@ -440,6 +459,7 @@ class GazeTracker:
         self._calib_center = None
         self.axis_flip_x = False
         self.axis_flip_y = False
+        self.vertical_gain = self._vertical_gain_base
         self._map_x = None
         self._map_y = None
         self._map_spans = None
@@ -481,6 +501,36 @@ class GazeTracker:
             self._calib_center = self._calib.get("center")
             self._calib_range = self._compute_calibration_range(self._calib)
 
+    def _auto_scale_vertical_gain(self, calib: Dict[str, Gaze]) -> None:
+        """Auto-scale vertical gain from calibration span to normalize vertical motion."""
+        def median_y(keys: List[str]) -> Optional[float]:
+            vals = [calib[k][1] for k in keys if k in calib]
+            if not vals:
+                return None
+            return float(np.median(vals))
+
+        top_y = median_y(["tl", "t", "tr"])
+        bottom_y = median_y(["bl", "b", "br"])
+        if top_y is None or bottom_y is None:
+            top_y = median_y(["tl", "tr"])
+            bottom_y = median_y(["bl", "br"])
+        if top_y is None or bottom_y is None:
+            return
+
+        span_y = abs(float(bottom_y - top_y))
+        gain = float(np.clip(0.45 / max(span_y, 1e-3), 1.2, 3.5))
+        old_gain = float(max(self.vertical_gain, 1e-6))
+        self.vertical_gain = gain
+
+        # Rescale calibration Y around 0.5 so mapping stays consistent with new gain.
+        scale = gain / old_gain
+        if abs(scale - 1.0) < 1e-6:
+            return
+        for key, val in list(calib.items()):
+            y_new = 0.5 + (val[1] - 0.5) * scale
+            calib[key] = (float(val[0]), float(np.clip(y_new, 0.0, 1.0)))
+        self._calib_center = calib.get("center")
+
     def set_full_calibration(self, calib: Dict[str, Gaze], pad: float = 0.03) -> bool:
         """Set full calibration data and compute normalized ranges."""
         self.axis_flip_x, self.axis_flip_y = self._infer_axis_flips(calib)
@@ -490,8 +540,10 @@ class GazeTracker:
         }
         self._calib = corrected
         self._calib_center = corrected.get("center")
-        self._map_x, self._map_y = self._compute_piecewise_maps(corrected)
-        self._calib_range = self._compute_calibration_range(corrected, pad=pad)
+        # Auto-scale vertical gain based on calibration span (prevents Y compression).
+        self._auto_scale_vertical_gain(self._calib)
+        self._map_x, self._map_y = self._compute_piecewise_maps(self._calib)
+        self._calib_range = self._compute_calibration_range(self._calib, pad=pad)
         self._edge_counter_x = 0
         self._edge_counter_y = 0
         self._stable_lock = False
@@ -612,7 +664,9 @@ class GazeTracker:
                         self._map_x, self._map_y = self._compute_piecewise_maps(parsed)
                 else:
                     self._map_x, self._map_y = self._compute_piecewise_maps(parsed)
-                self._calib_range = self._compute_calibration_range(parsed, pad=pad)
+                # Auto-scale vertical gain from stored calibration points.
+                self._auto_scale_vertical_gain(self._calib)
+                self._calib_range = self._compute_calibration_range(self._calib, pad=pad)
                 self._calib_active = False
                 self._calib_index = 0
                 self._calib_samples = []
@@ -683,6 +737,7 @@ class GazeTracker:
         self._calib_range = None
         self.axis_flip_x = False
         self.axis_flip_y = False
+        self.vertical_gain = self._vertical_gain_base
         self._map_x = None
         self._map_y = None
         self._map_spans = None
