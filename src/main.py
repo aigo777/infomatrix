@@ -12,7 +12,7 @@ from gaze_tracker import GazeTracker
 def main() -> None:
     print("IrisKeys - Stage 3.0")
     print(
-        "Controls: q quit | esc emergency stop | m toggle mouse | space pause | s screenshot | k calibrate | r reset | l load calibration | t test | [/] edge_gain | 9/0 y_edge_gain | i/k y_scale | o/l y_offset | y flip | ,/. tau"
+        "Controls: q quit | esc emergency stop | m toggle mouse | space pause | s screenshot | k calibrate | r reset | l load calibration | t test | [/] edge_gain | 9/0 y_edge_gain | i/k y_scale | o/l y_offset | y flip | ,/. spring_k"
     )
 
     tracker = GazeTracker()
@@ -100,37 +100,46 @@ def main() -> None:
     lost_frames = 0
     last_face_time = time.time()
     last_cursor_time = time.time()
-    cursor_deadzone_lock = False
     sx = None
     sy = None
-    edge_gain = 0.12
-    tau = 0.06
+    vx_c = 0.0
+    vy_c = 0.0
+    edge_gain = 0.25
+    # Cursor dynamics (tune for smoothness)
+    spring_k = 55.0
+    spring_d = 14.0
+    max_speed = 2200.0
+    max_accel = 9000.0
     drift_x = 0.0
     drift_y = 0.0
     drift_max = 0.04
     y_scale = 1.35
     y_offset = 0.0
     y_flip = False
-    y_edge_gain = 0.03
+    y_edge_gain = 0.25
 
     print("Cursor backend: ctypes")
 
     def clamp01(val: float) -> float:
         return float(np.clip(val, 0.0, 1.0))
 
-    def apply_edge_gain(u: float, gain: float) -> float:
-        return clamp01(u + gain * (u - 0.5) * abs(u - 0.5))
+    def soft_edge_curve(u: float, strength: float) -> float:
+        # strength in [0..1], 0 = linear, 1 = strong
+        u = float(np.clip(u, 0.0, 1.0))
+        s = float(np.clip(strength, 0.0, 1.0))
+        smooth = u * u * (3.0 - 2.0 * u)
+        return (1.0 - s) * u + s * smooth
 
     def transform_gaze(gaze: tuple[float, float]) -> tuple[float, float]:
         gx = clamp01(gaze[0])
-        gx = apply_edge_gain(gx, edge_gain)
+        gx = soft_edge_curve(gx, edge_gain)
 
         gy = gaze[1]
         if y_flip:
             gy = 1.0 - gy
         gy = (gy - 0.5) * y_scale + 0.5 + y_offset
         gy = clamp01(gy)
-        gy = apply_edge_gain(gy, y_edge_gain)
+        gy = soft_edge_curve(gy, y_edge_gain)
         return gx, gy
 
     def get_cursor_pos() -> tuple[int, int]:
@@ -158,7 +167,7 @@ def main() -> None:
         gaze_pointer = tracker.get_mapped_gaze(result)
 
         if isinstance(gaze_pointer, tuple):
-            if cursor_deadzone_lock:
+            if mouse_enabled:
                 drift_rate = 0.002
                 drift_x = float(
                     np.clip(drift_x + (gaze_pointer[0] - 0.5) * drift_rate, -drift_max, drift_max)
@@ -194,9 +203,10 @@ def main() -> None:
             lost_frames += 1
             if now - last_face_time > 0.25 and mouse_enabled:
                 mouse_enabled = False
-                cursor_deadzone_lock = False
                 sx = None
                 sy = None
+                vx_c = 0.0
+                vy_c = 0.0
                 print("Mouse control auto-disabled (face lost).")
 
         if calib_active:
@@ -359,7 +369,7 @@ def main() -> None:
             (255, 255, 255),
             2,
         )
-        alpha_text = f"alpha={tracker._last_alpha:.2f} tau={tau:.2f} edge={edge_gain:.2f}"
+        alpha_text = f"spring_k={spring_k:.0f} edge={edge_gain:.2f}"
         cv2.putText(
             pointer_frame,
             alpha_text,
@@ -500,41 +510,25 @@ def main() -> None:
                     cx, cy = get_cursor_pos()
                     sx = float(cx)
                     sy = float(cy)
-                    cursor_deadzone_lock = False
+                    vx_c = 0.0
+                    vy_c = 0.0
 
-                dist = float(np.hypot(target_x - sx, target_y - sy))
-                if cursor_deadzone_lock:
-                    if dist > 12.0:
-                        cursor_deadzone_lock = False
-                    else:
-                        sx = float(target_x)
-                        sy = float(target_y)
-                        set_cursor_pos(int(round(sx)), int(round(sy)))
-                        last_cursor_time = now
-                        dist = 0.0
+                dt = float(np.clip(now - last_cursor_time, 1e-4, 0.05))
+                last_cursor_time = now
 
-                if not cursor_deadzone_lock and dist < 8.0:
-                    cursor_deadzone_lock = True
-                    sx = float(target_x)
-                    sy = float(target_y)
-                    set_cursor_pos(int(round(sx)), int(round(sy)))
-                    last_cursor_time = now
-                elif not cursor_deadzone_lock:
-                    dt = max(now - last_cursor_time, 1e-6)
-                    last_cursor_time = now
-                    alpha = 1.0 - math.exp(-dt / max(tau, 1e-4))
-                    sx_new = sx + alpha * (target_x - sx)
-                    sy_new = sy + alpha * (target_y - sy)
-                    max_delta = 3000.0 * dt
-                    dx = sx_new - sx
-                    dy = sy_new - sy
-                    if abs(dx) > max_delta:
-                        dx = math.copysign(max_delta, dx)
-                    if abs(dy) > max_delta:
-                        dy = math.copysign(max_delta, dy)
-                    sx += dx
-                    sy += dy
-                    set_cursor_pos(int(round(sx)), int(round(sy)))
+                ex = float(target_x - sx)
+                ey = float(target_y - sy)
+                ax = spring_k * ex - spring_d * vx_c
+                ay = spring_k * ey - spring_d * vy_c
+                ax = float(np.clip(ax, -max_accel, max_accel))
+                ay = float(np.clip(ay, -max_accel, max_accel))
+                vx_c += ax * dt
+                vy_c += ay * dt
+                vx_c = float(np.clip(vx_c, -max_speed, max_speed))
+                vy_c = float(np.clip(vy_c, -max_speed, max_speed))
+                sx += vx_c * dt
+                sy += vy_c * dt
+                set_cursor_pos(int(round(sx)), int(round(sy)))
             except Exception as exc:
                 print(f"Mouse control error: {exc}")
                 mouse_enabled = False
@@ -568,9 +562,10 @@ def main() -> None:
             center_gy_list = []
             tracker.reset_calibration()
             mouse_enabled = False
-            cursor_deadzone_lock = False
             sx = None
             sy = None
+            vx_c = 0.0
+            vy_c = 0.0
             print("Calibration started: 3x3 grid (top-left -> top -> top-right -> left -> center -> right -> bottom-left -> bottom -> bottom-right)")
         if key == ord("r"):
             tracker.reset_calibration()
@@ -584,9 +579,10 @@ def main() -> None:
             center_open_list = []
             center_gy_list = []
             mouse_enabled = False
-            cursor_deadzone_lock = False
             sx = None
             sy = None
+            vx_c = 0.0
+            vy_c = 0.0
             print("Calibration reset.")
         if key == ord("l"):
             if mouse_enabled or mouse_paused:
@@ -608,7 +604,8 @@ def main() -> None:
                     cx, cy = get_cursor_pos()
                     sx = float(cx)
                     sy = float(cy)
-                    cursor_deadzone_lock = False
+                    vx_c = 0.0
+                    vy_c = 0.0
                 print(f"Mouse control {'enabled' if mouse_enabled else 'disabled'}.")
         if key == ord(" "):
             mouse_paused = not mouse_paused
@@ -619,11 +616,11 @@ def main() -> None:
             edge_gain = float(np.clip(edge_gain - 0.02, 0.0, 0.5))
             print(f"edge_gain={edge_gain:.2f}")
         if key == ord(","):
-            tau = float(np.clip(tau - 0.01, 0.01, 0.2))
-            print(f"tau={tau:.2f}")
+            spring_k = float(np.clip(spring_k - 5.0, 20.0, 120.0))
+            print(f"spring_k={spring_k:.0f}")
         if key == ord("."):
-            tau = float(np.clip(tau + 0.01, 0.01, 0.2))
-            print(f"tau={tau:.2f}")
+            spring_k = float(np.clip(spring_k + 5.0, 20.0, 120.0))
+            print(f"spring_k={spring_k:.0f}")
         if key == ord("i"):
             y_scale = float(np.clip(y_scale + 0.05, 0.6, 2.5))
             print(f"y_scale={y_scale:.2f}")
