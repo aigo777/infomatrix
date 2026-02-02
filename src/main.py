@@ -103,7 +103,7 @@ def main() -> None:
     cursor_deadzone_lock = False
     sx = None
     sy = None
-    edge_gain = 0.18
+    edge_gain = 0.12
     tau = 0.06
     drift_x = 0.0
     drift_y = 0.0
@@ -111,7 +111,7 @@ def main() -> None:
     y_scale = 1.35
     y_offset = 0.0
     y_flip = False
-    y_edge_gain = 0.08
+    y_edge_gain = 0.03
 
     print("Cursor backend: ctypes")
 

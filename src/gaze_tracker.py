@@ -137,6 +137,10 @@ class GazeTracker:
         self._edge_counter_y = 0
         self._edge_hold_frames = 6
         self._edge_threshold = 0.08
+        self._edge_pad_x = 0.05
+        self._edge_power_x = 1.6
+        self._edge_pad_y = 0.03
+        self._edge_power_y = 1.35
         self._soft_pad = 0.06
         self._soft_k = 0.35
         self._min_span = 0.04
@@ -1036,21 +1040,24 @@ class GazeTracker:
         return self._clamp01(gx01), self._clamp01(gy01)
 
     def _apply_edge_resistance(self, u: float, axis: str) -> float:
-        threshold = self._edge_threshold
-        counter = self._edge_counter_x if axis == "x" else self._edge_counter_y
-        near_edge = u < threshold or u > (1.0 - threshold)
-        if near_edge:
-            counter += 1
-        else:
-            counter = 0
-
+        u = self._clamp01(u)
         if axis == "x":
-            self._edge_counter_x = counter
+            pad = self._edge_pad_x
+            power = self._edge_power_x
         else:
-            self._edge_counter_y = counter
+            pad = self._edge_pad_y
+            power = self._edge_power_y
 
-        if counter < self._edge_hold_frames:
-            return float(np.clip(u, threshold, 1.0 - threshold))
+        pad = float(np.clip(pad, 0.0, 0.25))
+        power = float(max(1.0, power))
+        if pad <= 1e-6:
+            return u
+
+        if u < pad:
+            return self._clamp01(pad * (u / pad) ** power)
+        if u > 1.0 - pad:
+            t = (1.0 - u) / pad
+            return self._clamp01(1.0 - pad * (t ** power))
         return u
 
     def _apply_deadband(self, gaze: Gaze) -> Gaze:
