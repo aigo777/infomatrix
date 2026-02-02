@@ -137,10 +137,10 @@ class GazeTracker:
         self._edge_counter_y = 0
         self._edge_hold_frames = 6
         self._edge_threshold = 0.08
-        self._edge_pad_x = 0.05
-        self._edge_power_x = 1.6
-        self._edge_pad_y = 0.03
-        self._edge_power_y = 1.35
+        self._edge_pad_x = 0.06
+        self._edge_pad_y = 0.04
+        self._edge_overshoot_x = 0.05
+        self._edge_overshoot_y = 0.04
         self._soft_pad = 0.06
         self._soft_k = 0.35
         self._min_span = 0.04
@@ -654,27 +654,16 @@ class GazeTracker:
             return None
 
         gx, gy = gaze_raw
-        if (
-            self._open_ref is not None
-            and self._last_openness is not None
-            and abs(self._open_beta_y) > 1e-6
-        ):
-            gy = gy - self._open_beta_y * (self._last_openness - self._open_ref)
-            gy = float(np.clip(gy, 0.0, 1.0))
-
+        # Openness is kept for diagnostics only; it does not shift gaze.
         gx, gy = self.apply_axis_flip((gx, gy))
-        if self._map_x is not None and self._map_y is not None and self._piecewise_ok:
-            gx01 = self._map_piecewise(gx, self._map_x["L"], self._map_x["C"], self._map_x["R"])
-            gy01 = self._map_piecewise(gy, self._map_y["T"], self._map_y["C"], self._map_y["B"])
-            mapped = (self._clamp01(gx01), self._clamp01(gy01))
-            return self._post_map_adjust(mapped, (gx, gy))
 
         if self._calib_range is not None:
             gx_min, gx_max, gy_min, gy_max = self._calib_range
             if gx_max - gx_min > 1e-6 and gy_max - gy_min > 1e-6:
+                # Linear, reversible mapping for calibration.
                 gx01 = (gx - gx_min) / (gx_max - gx_min)
                 gy01 = (gy - gy_min) / (gy_max - gy_min)
-                mapped = (self._clamp01(gx01), self._clamp01(gy01))
+                mapped = (gx01, gy01)
                 return self._post_map_adjust(mapped, (gx, gy))
 
         center = self._calib_center if self._calib_center is not None else (0.5, 0.5)
@@ -939,34 +928,35 @@ class GazeTracker:
         if not upper_pts or not lower_pts:
             return None
 
-        upper_y = float(np.mean([pt[1] for pt in upper_pts]))
-        lower_y = float(np.mean([pt[1] for pt in lower_pts]))
+        upper_y = float(np.median([pt[1] for pt in upper_pts]))
+        lower_y = float(np.median([pt[1] for pt in lower_pts]))
 
         # Prefer horizontal x-ratio for better left/right sensitivity.
         x_min = min(outer[0], inner[0])
         x_max = max(outer[0], inner[0])
         x_span = x_max - x_min
+        eye_vec = (inner[0] - outer[0], inner[1] - outer[1])
+        denom = eye_vec[0] * eye_vec[0] + eye_vec[1] * eye_vec[1]
+        eye_width = float(math.hypot(eye_vec[0], eye_vec[1]))
+        if eye_width < 1e-6 or denom < 1e-6:
+            return None
+
         if x_span > 1e-6:
             gx = float(np.clip((iris[0] - x_min) / x_span, 0.0, 1.0))
         else:
-            eye_vec = (inner[0] - outer[0], inner[1] - outer[1])
-            denom = eye_vec[0] * eye_vec[0] + eye_vec[1] * eye_vec[1]
-            if denom < 1e-6:
-                return None
             t = ((iris[0] - outer[0]) * eye_vec[0] + (iris[1] - outer[1]) * eye_vec[1]) / denom
             gx = float(np.clip(t, 0.0, 1.0))
 
-        # Use vertical offset from eyelid center to reduce blink sensitivity.
-        eye_center_y = (upper_y + lower_y) * 0.5
-        eye_height = max(abs(lower_y - upper_y), 1e-6)
-        v = (iris[1] - eye_center_y) / eye_height
-        gy = float(np.clip(0.5 + v * self.vertical_gain, 0.0, 1.0))
+        # Vertical gaze from iris projection onto eye-axis normal (blink-invariant).
+        eye_center = ((outer[0] + inner[0]) * 0.5, (outer[1] + inner[1]) * 0.5)
+        nx = -eye_vec[1] / eye_width
+        ny = eye_vec[0] / eye_width
+        v = (iris[0] - eye_center[0]) * nx + (iris[1] - eye_center[1]) * ny
+        v_norm = v / max(eye_width, 1e-6)
+        gy = float(np.clip(0.5 + v_norm * self.vertical_gain, 0.0, 1.0))
 
-        if x_span > 1e-6:
-            eye_width = max(abs(x_span), 1e-6)
-        else:
-            eye_width = max(np.sqrt(denom), 1e-6)
-        openness = float(eye_height / eye_width)
+        eye_height = max(abs(lower_y - upper_y), 1e-6)
+        openness = float(eye_height / max(eye_width, 1e-6))
 
         return gx, gy, openness
 
@@ -988,7 +978,6 @@ class GazeTracker:
         xs = [pt[0] for pt in self._gaze_window]
         ys = [pt[1] for pt in self._gaze_window]
         med = (float(np.median(xs)), float(np.median(ys)))
-        med = self._apply_deadband(med)
 
         gx, gy = self._one_euro.filter(med[0], med[1], now)
         self._last_alpha = self._one_euro.last_alpha
@@ -1028,36 +1017,48 @@ class GazeTracker:
 
     def _post_map_adjust(self, mapped: Gaze, raw_corrected: Gaze) -> Gaze:
         gx01, gy01 = mapped
-        if self._calib_center is not None:
-            dx = raw_corrected[0] - self._calib_center[0]
-            dy = raw_corrected[1] - self._calib_center[1]
-            if math.hypot(dx, dy) <= self._raw_center_radius:
-                gx01 = gx01 + (0.5 - gx01) * self._center_pull
-                gy01 = gy01 + (0.5 - gy01) * self._center_pull
-
+        # Soft saturation after mapping to avoid snapping while keeping corners reachable.
         gx01 = self._apply_edge_resistance(gx01, axis="x")
         gy01 = self._apply_edge_resistance(gy01, axis="y")
         return self._clamp01(gx01), self._clamp01(gy01)
 
     def _apply_edge_resistance(self, u: float, axis: str) -> float:
-        u = self._clamp01(u)
+        u = float(u)
         if axis == "x":
             pad = self._edge_pad_x
-            power = self._edge_power_x
+            overshoot = self._edge_overshoot_x
         else:
             pad = self._edge_pad_y
-            power = self._edge_power_y
+            overshoot = self._edge_overshoot_y
 
         pad = float(np.clip(pad, 0.0, 0.25))
-        power = float(max(1.0, power))
+        overshoot = float(np.clip(overshoot, 0.0, 0.2))
         if pad <= 1e-6:
-            return u
+            return self._clamp01(u)
 
+        # Allow slight overshoot before smooth compression.
+        u = float(np.clip(u, -overshoot, 1.0 + overshoot))
+
+        def smoothstep(t: float) -> float:
+            t = float(np.clip(t, 0.0, 1.0))
+            return t * t * (3.0 - 2.0 * t)
+
+        if u <= 0.0:
+            if overshoot <= 1e-6:
+                return 0.0
+            t = (u + overshoot) / max(overshoot, 1e-6)
+            return pad * smoothstep(t)
+        if u >= 1.0:
+            if overshoot <= 1e-6:
+                return 1.0
+            t = (u - 1.0) / max(overshoot, 1e-6)
+            return 1.0 - pad + pad * smoothstep(t)
         if u < pad:
-            return self._clamp01(pad * (u / pad) ** power)
+            t = u / pad
+            return pad * smoothstep(t)
         if u > 1.0 - pad:
             t = (1.0 - u) / pad
-            return self._clamp01(1.0 - pad * (t ** power))
+            return 1.0 - pad * smoothstep(t)
         return u
 
     def _apply_deadband(self, gaze: Gaze) -> Gaze:
