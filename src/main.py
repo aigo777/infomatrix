@@ -1,5 +1,5 @@
 ﻿from __future__ import annotations
-
+a=0
 import os
 import time
 from collections import deque
