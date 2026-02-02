@@ -561,6 +561,7 @@ class GazeTracker:
 
     def save_calibration(self, path: str) -> bool:
         """Save calibration data to disk."""
+        print("Vertical span:", self._calib_range[3] - self._calib_range[2])
         if self._calib_range is None and not self._calib:
             return False
 
@@ -814,8 +815,8 @@ class GazeTracker:
 
         gx_min = min(calib["tl"][0], calib["bl"][0], center[0])
         gx_max = max(calib["tr"][0], calib["br"][0], center[0])
-        gy_min = min(calib["tl"][1], calib["tr"][1], center[1])
-        gy_max = max(calib["bl"][1], calib["br"][1], center[1])
+        gy_min = min(calib["tl"][1], calib["tr"][1])
+        gy_max = max(calib["bl"][1], calib["br"][1])
 
         pad = float(np.clip(pad, 0.0, 0.2))
         gx_min = self._clamp01(gx_min - pad)
@@ -1006,9 +1007,24 @@ class GazeTracker:
         eye_center = ((outer[0] + inner[0]) * 0.5, (outer[1] + inner[1]) * 0.5)
         nx = -eye_vec[1] / eye_width
         ny = eye_vec[0] / eye_width
+# --- Iris-based vertical ---
         v = (iris[0] - eye_center[0]) * nx + (iris[1] - eye_center[1]) * ny
         v_norm = v / max(eye_width, 1e-6)
-        gy = float(np.clip(0.5 + v_norm * self.vertical_gain, 0.0, 1.0))
+
+        # --- Eyelid-based vertical (stronger signal) ---
+        lid_mid = 0.5 * (upper_y + lower_y)
+        lid_span = max(abs(lower_y - upper_y), 1e-6)
+        lid_norm = (lid_mid - eye_center[1]) / lid_span
+
+        # --- Fuse signals ---
+        # Iris = precise but weak
+        # Lid = strong but noisy
+        gy_raw = (
+            0.35 * v_norm +
+            0.65 * lid_norm
+        )
+
+        gy = float(np.clip(0.5 + gy_raw * self.vertical_gain, 0.0, 1.0))
 
         eye_height = max(abs(lower_y - upper_y), 1e-6)
         openness = float(eye_height / max(eye_width, 1e-6))
@@ -1074,7 +1090,8 @@ class GazeTracker:
         gx01, gy01 = mapped
         # Soft saturation after mapping to avoid snapping while keeping corners reachable.
         gx01 = self._apply_edge_resistance(gx01, axis="x")
-        gy01 = self._apply_edge_resistance(gy01, axis="y")
+        #kills corners or something
+        #gy01 = self._apply_edge_resistance(gy01, axis="y")
         return self._clamp01(gx01), self._clamp01(gy01)
 
     def _apply_edge_resistance(self, u: float, axis: str) -> float:

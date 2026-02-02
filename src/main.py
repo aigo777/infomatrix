@@ -269,6 +269,7 @@ def main() -> None:
                                 print("Vertical span too small; keep head fixed, avoid eyebrow movement; try again.")
                                 y_scale = float(np.clip(0.18 / max(span, 1e-3), 0.8, 2.5))
                         print(f"Calibration saved to {calib_path}")
+                        
                     else:
                         print("Calibration failed: range invalid.")
 
