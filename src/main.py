@@ -116,7 +116,7 @@ def main() -> None:
     y_scale = 1.35
     y_offset = 0.0
     y_flip = False
-    y_edge_gain = 0.25
+    y_edge_gain = 0.18
 
     print("Cursor backend: ctypes")
 
@@ -130,16 +130,41 @@ def main() -> None:
         smooth = u * u * (3.0 - 2.0 * u)
         return (1.0 - s) * u + s * smooth
 
+    def mid_edge_expand(u: float, v: float, strength: float = 0.18) -> float:
+        """
+        Expands coordinate u when the orthogonal coordinate v is near center.
+        Used to fix mid-edge compression.
+        """
+        v_dist = abs(v - 0.5) * 2.0
+        center_weight = 1.0 - np.clip(v_dist, 0.0, 1.0)
+        expand = strength * center_weight
+        return float(np.clip(0.5 + (u - 0.5) * (1.0 + expand), 0.0, 1.0))
+
+    def vertical_extreme_damp(u: float, strength: float = 0.35) -> float:
+        """
+        Damp movement near top/bottom edges to prevent snapping.
+        """
+        d = abs(u - 0.5) * 2.0
+        if d < 0.75:
+            return u
+        t = (d - 0.75) / 0.25
+        damp = 1.0 - strength * t * t
+        return float(np.clip(0.5 + (u - 0.5) * damp, 0.0, 1.0))
+
     def transform_gaze(gaze: tuple[float, float]) -> tuple[float, float]:
         gx = clamp01(gaze[0])
-        gx = soft_edge_curve(gx, edge_gain)
-
         gy = gaze[1]
         if y_flip:
             gy = 1.0 - gy
         gy = (gy - 0.5) * y_scale + 0.5 + y_offset
         gy = clamp01(gy)
+
+        gx = mid_edge_expand(gx, gy, strength=0.22)
+        gy = mid_edge_expand(gy, gx, strength=0.10)
+
+        gx = soft_edge_curve(gx, edge_gain)
         gy = soft_edge_curve(gy, y_edge_gain)
+        gy = vertical_extreme_damp(gy, strength=0.35)
         return gx, gy
 
     def get_cursor_pos() -> tuple[int, int]:
@@ -519,7 +544,9 @@ def main() -> None:
                 ex = float(target_x - sx)
                 ey = float(target_y - sy)
                 ax = spring_k * ex - spring_d * vx_c
-                ay = spring_k * ey - spring_d * vy_c
+                edge_y = abs((sy / vh) - 0.5) * 2.0 if vh else 0.0
+                y_damp = 1.0 - 0.35 * np.clip(edge_y, 0.0, 1.0)
+                ay = (spring_k * y_damp) * ey - spring_d * vy_c
                 ax = float(np.clip(ax, -max_accel, max_accel))
                 ay = float(np.clip(ay, -max_accel, max_accel))
                 vx_c += ax * dt
