@@ -1051,6 +1051,10 @@ class GazeTracker:
         med = (float(np.median(xs)), float(np.median(ys)))
 
         gx, gy = self._one_euro.filter(med[0], med[1], now)
+        # Reduce smoothing when nearly stationary for finer aiming.
+        if self._one_euro.last_velocity < 0.012:
+            gx = 0.7 * gx + 0.3 * med[0]
+            gy = 0.7 * gy + 0.3 * med[1]
         self._last_alpha = self._one_euro.last_alpha
         self._last_cutoff = self._one_euro.last_cutoff
         self._last_velocity = self._one_euro.last_velocity

@@ -151,6 +151,10 @@ def main() -> None:
         damp = 1.0 - strength * t * t
         return float(np.clip(0.5 + (u - 0.5) * damp, 0.0, 1.0))
 
+    def cornerness(x: float, y: float) -> float:
+        # 0 = center, 1 = corner
+        return max(abs(x - 0.5), abs(y - 0.5)) * 2.0
+
     def transform_gaze(gaze: tuple[float, float]) -> tuple[float, float]:
         gx = clamp01(gaze[0])
         gy = gaze[1]
@@ -159,12 +163,24 @@ def main() -> None:
         gy = (gy - 0.5) * y_scale + 0.5 + y_offset
         gy = clamp01(gy)
 
-        gx = mid_edge_expand(gx, gy, strength=0.22)
-        gy = mid_edge_expand(gy, gx, strength=0.10)
+        gx = mid_edge_expand(gx, gy, strength=0.18)
+        gy = mid_edge_expand(gy, gx, strength=0.08)
 
-        gx = soft_edge_curve(gx, edge_gain)
-        gy = soft_edge_curve(gy, y_edge_gain)
-        gy = vertical_extreme_damp(gy, strength=0.35)
+        c = cornerness(gx, gy)
+        if c < 0.75:
+            gx = soft_edge_curve(gx, edge_gain)
+            gy = soft_edge_curve(gy, y_edge_gain)
+            gy = vertical_extreme_damp(gy, strength=0.30)
+
+        reach = 1.08
+        gx = clamp01(0.5 + (gx - 0.5) * reach)
+        gy = clamp01(0.5 + (gy - 0.5) * reach)
+
+        vel = tracker._last_velocity
+        if vel is not None and vel < 0.015:
+            precision_gain = 1.12
+            gx = clamp01(0.5 + (gx - 0.5) * precision_gain)
+            gy = clamp01(0.5 + (gy - 0.5) * precision_gain)
         return gx, gy
 
     def get_cursor_pos() -> tuple[int, int]:
