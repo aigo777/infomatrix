@@ -163,8 +163,8 @@ def main() -> None:
         gy = (gy - 0.5) * y_scale + 0.5 + y_offset
         gy = clamp01(gy)
 
-        gx = mid_edge_expand(gx, gy, strength=0.18)
-        gy = mid_edge_expand(gy, gx, strength=0.08)
+        #gx = mid_edge_expand(gx, gy, strength=0.18)
+        #gy = mid_edge_expand(gy, gx, strength=0.08)
 
         c = cornerness(gx, gy)
         if c < 0.75:
@@ -172,15 +172,15 @@ def main() -> None:
             gy = soft_edge_curve(gy, y_edge_gain)
             gy = vertical_extreme_damp(gy, strength=0.30)
 
-        reach = 1.08
-        gx = clamp01(0.5 + (gx - 0.5) * reach)
-        gy = clamp01(0.5 + (gy - 0.5) * reach)
+        #reach = 1.08
+        #gx = clamp01(0.5 + (gx - 0.5) * reach)
+        #gy = clamp01(0.5 + (gy - 0.5) * reach)
 
         vel = tracker._last_velocity
-        if vel is not None and vel < 0.015:
-            precision_gain = 1.12
-            gx = clamp01(0.5 + (gx - 0.5) * precision_gain)
-            gy = clamp01(0.5 + (gy - 0.5) * precision_gain)
+        #if vel is not None and vel < 0.015:
+            #precision_gain = 1.12
+            #gx = clamp01(0.5 + (gx - 0.5) * precision_gain)
+            #gy = clamp01(0.5 + (gy - 0.5) * precision_gain)
         return gx, gy
 
     def get_cursor_pos() -> tuple[int, int]:
