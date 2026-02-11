@@ -35,28 +35,26 @@ def main() -> None:
     if tracker.load_calibration(calib_path):
         print(f"Loaded calibration from {calib_path}")
 
-    calib_targets = [
-        ("tl", "TOP-LEFT", (0.08, 0.08)),
-        ("t", "TOP", (0.50, 0.08)),
-        ("tr", "TOP-RIGHT", (0.92, 0.08)),
-        ("l", "LEFT", (0.08, 0.50)),
-        ("center", "CENTER", (0.50, 0.50)),
-        ("r", "RIGHT", (0.92, 0.50)),
-        ("bl", "BOTTOM-LEFT", (0.08, 0.92)),
-        ("b", "BOTTOM", (0.50, 0.92)),
-        ("br", "BOTTOM-RIGHT", (0.92, 0.92)),
-    ]
+    xs = [0.08, 0.38, 0.62, 0.92]
+    ys = [0.08, 0.38, 0.62, 0.92]
+    calib_targets: list[tuple[str, str, tuple[float, float]]] = []
+    for row, y in enumerate(ys):
+        for col, x in enumerate(xs):
+            key = f"p{row}{col}"
+            label = f"CAL (row {row + 1}/4, col {col + 1}/4)"
+            calib_targets.append((key, label, (x, y)))
+    center_keys = {"p11", "p12", "p21", "p22"}
     calib_active = False
     calib_phase = "idle"
     calib_index = 0
     calib_samples: list[tuple[float, float, float]] = []
-    calib_data: dict[str, tuple[float, float]] = {}
-    calib_quality: dict[str, dict[str, float]] = {}
-    calib_open: dict[str, float] = {}
+    calib_data_16: dict[str, tuple[float, float]] = {}
+    calib_quality_16: dict[str, dict[str, float]] = {}
+    calib_open_16: dict[str, float] = {}
     center_open_list: list[float] = []
     center_gy_list: list[float] = []
     calib_settle_s = 0.8
-    calib_samples_needed = 75
+    calib_samples_needed = 40
     calib_phase_start = 0.0
     calib_pad = 0.03
     calib_mad_thresh = 0.015
@@ -122,6 +120,11 @@ def main() -> None:
 
     def clamp01(val: float) -> float:
         return float(np.clip(val, 0.0, 1.0))
+
+    def avg_points(keys: list[str], data: dict[str, tuple[float, float]]) -> tuple[float, float]:
+        xs_avg = [data[k][0] for k in keys]
+        ys_avg = [data[k][1] for k in keys]
+        return float(np.mean(xs_avg)), float(np.mean(ys_avg))
 
     def soft_edge_curve(u: float, strength: float) -> float:
         # strength in [0..1], 0 = linear, 1 = strong
@@ -274,12 +277,12 @@ def main() -> None:
                             calib_samples = []
                             continue
                         name = calib_targets[calib_index][0]
-                        calib_data[name] = (float(med[0]), float(med[1]))
-                        calib_open[name] = open_med
-                        if name == "center":
-                            center_open_list = opens[:]
-                            center_gy_list = [s[1] for s in calib_samples]
-                        calib_quality[name] = {
+                        calib_data_16[name] = (float(med[0]), float(med[1]))
+                        calib_open_16[name] = open_med
+                        if name in center_keys:
+                            center_open_list.extend(opens)
+                            center_gy_list.extend([s[1] for s in calib_samples])
+                        calib_quality_16[name] = {
                             "median_x": float(med[0]),
                             "median_y": float(med[1]),
                             "mad_x": float(mad[0]),
@@ -293,9 +296,28 @@ def main() -> None:
                 if calib_index >= len(calib_targets):
                     calib_active = False
                     calib_phase = "idle"
-                    success = tracker.set_full_calibration(calib_data, pad=calib_pad)
+                    calib_data_compat = {
+                        "tl": calib_data_16["p00"],
+                        "tr": calib_data_16["p03"],
+                        "bl": calib_data_16["p30"],
+                        "br": calib_data_16["p33"],
+                        "t": avg_points(["p01", "p02"], calib_data_16),
+                        "b": avg_points(["p31", "p32"], calib_data_16),
+                        "l": avg_points(["p10", "p20"], calib_data_16),
+                        "r": avg_points(["p13", "p23"], calib_data_16),
+                        "center": avg_points(["p11", "p12", "p21", "p22"], calib_data_16),
+                    }
+                    success = tracker.set_full_calibration(calib_data_compat, pad=calib_pad)
                     if success:
-                        open_ref = calib_open.get("center")
+                        open_ref = None
+                        if center_open_list:
+                            open_ref = float(np.median(np.array(center_open_list, dtype=np.float32)))
+                        else:
+                            center_open_vals = [
+                                calib_open_16[k] for k in ("p11", "p12", "p21", "p22") if k in calib_open_16
+                            ]
+                            if center_open_vals:
+                                open_ref = float(np.mean(center_open_vals))
                         beta_y = 0.0
                         if center_open_list:
                             open_arr = np.array(center_open_list, dtype=np.float32)
@@ -308,10 +330,10 @@ def main() -> None:
                                 beta_y = cov / var
                         if open_ref is not None:
                             tracker.set_openness_compensation(open_ref, beta_y)
-                        tracker.set_calibration_quality(calib_quality)
+                        tracker.set_calibration_quality(calib_quality_16)
                         tracker.save_calibration(calib_path)
-                        top_vals = [calib_data[k][1] for k in ("tl", "t", "tr") if k in calib_data]
-                        bot_vals = [calib_data[k][1] for k in ("bl", "b", "br") if k in calib_data]
+                        top_vals = [calib_data_compat[k][1] for k in ("tl", "t", "tr") if k in calib_data_compat]
+                        bot_vals = [calib_data_compat[k][1] for k in ("bl", "b", "br") if k in calib_data_compat]
                         top_vals = [tracker.apply_axis_flip((0.5, y))[1] for y in top_vals]
                         bot_vals = [tracker.apply_axis_flip((0.5, y))[1] for y in bot_vals]
                         if top_vals and bot_vals:
@@ -509,7 +531,7 @@ def main() -> None:
             cv2.line(pointer_frame, (tx - 25, ty), (tx + 25, ty), (255, 255, 255), 2)
             cv2.line(pointer_frame, (tx, ty - 25), (tx, ty + 25), (255, 255, 255), 2)
 
-            instruction = f"LOOK AT {label}"
+            instruction = f"LOOK AT CAL POINT {calib_index + 1}/16"
             size, _ = cv2.getTextSize(instruction, cv2.FONT_HERSHEY_SIMPLEX, 1.0, 2)
             cv2.putText(
                 pointer_frame,
@@ -598,9 +620,9 @@ def main() -> None:
                 calib_index = 0
                 calib_phase_start = time.time()
             calib_samples = []
-            calib_data = {}
-            calib_quality = {}
-            calib_open = {}
+            calib_data_16 = {}
+            calib_quality_16 = {}
+            calib_open_16 = {}
             center_open_list = []
             center_gy_list = []
             tracker.reset_calibration()
@@ -609,16 +631,16 @@ def main() -> None:
             sy = None
             vx_c = 0.0
             vy_c = 0.0
-            print("Calibration started: 3x3 grid (top-left -> top -> top-right -> left -> center -> right -> bottom-left -> bottom -> bottom-right)")
+            print("Calibration started: 4x4 grid (16 points, row-major).")
         if key == ord("r"):
             tracker.reset_calibration()
             calib_active = False
             calib_phase = "idle"
             calib_index = 0
             calib_samples = []
-            calib_data = {}
-            calib_quality = {}
-            calib_open = {}
+            calib_data_16 = {}
+            calib_quality_16 = {}
+            calib_open_16 = {}
             center_open_list = []
             center_gy_list = []
             mouse_enabled = False
