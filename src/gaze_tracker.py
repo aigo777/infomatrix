@@ -564,7 +564,7 @@ class GazeTracker:
         print("Vertical span:", self._calib_range[3] - self._calib_range[2])
         if self._calib_range is None and not self._calib:
             return False
-
+        
         os.makedirs(os.path.dirname(path), exist_ok=True)
         data = {
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -590,6 +590,7 @@ class GazeTracker:
                 "gy_min": gy_min,
                 "gy_max": gy_max,
             }
+            print(f"gx_min: {gx_min}, gx_max: {gx_max}")
 
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
