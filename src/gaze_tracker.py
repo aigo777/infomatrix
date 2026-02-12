@@ -261,7 +261,9 @@ class GazeTracker:
             "right_lower_pts": right_lower_pts,
         }
 
-        gaze_raw_uncal, eye_openness, iris_radius = self._compute_gaze(points_norm, left_radius, right_radius)
+        gaze_raw_uncal, eye_openness, iris_radius, gaze_features = self._compute_gaze(
+            points_norm, left_radius, right_radius
+        )
         self._last_openness = eye_openness
         eye_width_px = self._compute_eye_width_px(points_norm, w, h)
         face_confidence = self._face_confidence(iris_radius)
@@ -296,6 +298,7 @@ class GazeTracker:
             "gaze_smooth": gaze_smooth,
             "iris_radius": iris_radius,
             "eye_openness": eye_openness,
+            "gaze_features": gaze_features,
             "eye_width_px": eye_width_px,
             "face_confidence": face_confidence,
             "timestamp": timestamp,
@@ -306,7 +309,7 @@ class GazeTracker:
         points_norm = result_dict.get("points_norm")
         if not isinstance(points_norm, dict):
             return None
-        gaze_raw, _, _ = self._compute_gaze(points_norm, None, None)
+        gaze_raw, _, _, _ = self._compute_gaze(points_norm, None, None)
         return gaze_raw
 
     def get_mapped_gaze(self, result_dict: Dict[str, object]) -> Optional[Gaze]:
@@ -932,7 +935,7 @@ class GazeTracker:
         points_norm: Dict[str, object],
         left_radius: Optional[float],
         right_radius: Optional[float],
-    ) -> Tuple[Optional[Gaze], Optional[float], Optional[float]]:
+    ) -> Tuple[Optional[Gaze], Optional[float], Optional[float], Optional[Dict[str, float]]]:
         try:
             left_outer = points_norm["left_outer"]
             left_inner = points_norm["left_inner"]
@@ -945,7 +948,7 @@ class GazeTracker:
             right_lower = points_norm["right_lower"]
             right_iris = points_norm["right_iris_center"]
         except KeyError:
-            return None, None, None
+            return None, None, None, None
 
         left_upper_pts = points_norm.get("left_upper_pts") or [left_upper]
         left_lower_pts = points_norm.get("left_lower_pts") or [left_lower]
@@ -955,11 +958,11 @@ class GazeTracker:
         left = self._gaze_for_eye(left_outer, left_inner, left_upper_pts, left_lower_pts, left_iris)
         right = self._gaze_for_eye(right_outer, right_inner, right_upper_pts, right_lower_pts, right_iris)
         if left is None or right is None:
-            return None, None, None
+            return None, None, None, None
 
-        gx = (left[0] + right[0]) * 0.5
-        gy = (left[1] + right[1]) * 0.5
-        openness = (left[2] + right[2]) * 0.5
+        gx = 0.5 * (left["gx"] + right["gx"])
+        gy = 0.5 * (left["gy"] + right["gy"])
+        openness = 0.5 * (left["openness"] + right["openness"])
 
         if self.invert_x:
             gx = 1.0 - gx
@@ -972,7 +975,24 @@ class GazeTracker:
         if left_radius is not None and right_radius is not None:
             iris_radius = (left_radius + right_radius) * 0.5
 
-        return gaze_raw, openness, iris_radius
+        features = {
+            "gx": float(gx),
+            "gy": float(gy),
+            "lx": float(left["gx"]),
+            "ly": float(left["gy"]),
+            "rx": float(right["gx"]),
+            "ry": float(right["gy"]),
+            "open": float(openness),
+            "lopen": float(left["openness"]),
+            "ropen": float(right["openness"]),
+            "eye_w": float(0.5 * (left["eye_width"] + right["eye_width"])),
+            "lv": float(left["v_norm"]),
+            "rv": float(right["v_norm"]),
+            "llid": float(left["lid_norm"]),
+            "rlid": float(right["lid_norm"]),
+        }
+
+        return gaze_raw, openness, iris_radius, features
 
     def _gaze_for_eye(
         self,
@@ -981,7 +1001,7 @@ class GazeTracker:
         upper_pts: List[Point],
         lower_pts: List[Point],
         iris: Point,
-    ) -> Optional[Tuple[float, float, float]]:
+    ) -> Optional[Dict[str, float]]:
         if not upper_pts or not lower_pts:
             return None
 
@@ -1030,7 +1050,16 @@ class GazeTracker:
         eye_height = max(abs(lower_y - upper_y), 1e-6)
         openness = float(eye_height / max(eye_width, 1e-6))
 
-        return gx, gy, openness
+        return {
+            "gx": gx,
+            "gy": gy,
+            "openness": openness,
+            "eye_width": eye_width,
+            "v_norm": float(v_norm),
+            "lid_norm": float(lid_norm),
+            "upper_y": float(upper_y),
+            "lower_y": float(lower_y),
+        }
 
     def _smooth_gaze(self, gaze: Optional[Gaze]) -> Optional[Gaze]:
         now = time.time()
