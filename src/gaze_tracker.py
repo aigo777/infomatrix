@@ -1134,7 +1134,7 @@ class GazeTracker:
     def _post_map_adjust(self, mapped: Gaze, raw_corrected: Gaze) -> Gaze:
         gx01, gy01 = mapped
         # Soft saturation after mapping to avoid snapping while keeping corners reachable.
-        gx01 = self._apply_edge_resistance(gx01, axis="x")
+        #gx01 = self._apply_edge_resistance(gx01, axis="x")
         #kills corners or something
         #gy01 = self._apply_edge_resistance(gy01, axis="y")
         return self._clamp01(gx01), self._clamp01(gy01)

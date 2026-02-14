@@ -328,6 +328,11 @@ def main() -> None:
                                 print("Vertical span too small; keep head fixed, avoid eyebrow movement; try again.")
                                 y_scale = float(np.clip(0.18 / max(span, 1e-3), 0.8, 2.5))
                         print(f"Calibration saved to {calib_path}")
+
+                        print("gx_min:", tracker._calib_range[0], "gx_max:", tracker._calib_range[1])
+                        print("gy_min:", tracker._calib_range[2], "gy_max:", tracker._calib_range[3])
+                        print("span_x:", tracker._calib_range[1]-tracker._calib_range[0], "span_y:", tracker._calib_range[3]-tracker._calib_range[2])
+
                         
                     else:
                         print("Calibration failed: range invalid.")
