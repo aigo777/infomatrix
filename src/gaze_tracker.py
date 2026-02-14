@@ -179,6 +179,10 @@ class GazeTracker:
         self._last_openness: Optional[float] = None
         self._open_ref: Optional[float] = None
         self._open_beta_y: float = 0.0
+        self._blink_freeze = True
+        self._blink_ratio = 0.60
+        self._open_min_abs = 0.12
+        self._last_good_gaze: Optional[Gaze] = None
 
         self._gaze_smooth: Optional[Gaze] = None
         self._calib_center: Optional[Gaze] = None
@@ -713,6 +717,12 @@ class GazeTracker:
         if gaze_raw is None:
             return None
 
+        if self._blink_freeze and self._open_ref is not None and self._last_openness is not None:
+            open_now = float(self._last_openness)
+            if open_now < max(self._open_min_abs, self._open_ref * self._blink_ratio):
+                if self._last_good_gaze is not None:
+                    return self._last_good_gaze
+
         gx, gy = gaze_raw
         # Openness is kept for diagnostics only; it does not shift gaze.
         gx, gy = self.apply_axis_flip((gx, gy))
@@ -723,8 +733,9 @@ class GazeTracker:
                 # Linear, reversible mapping for calibration.
                 gx01 = (gx - gx_min) / (gx_max - gx_min)
                 gy01 = (gy - gy_min) / (gy_max - gy_min)
-                mapped = (gx01, gy01)
-                return self._post_map_adjust(mapped, (gx, gy))
+                mapped = self._post_map_adjust((gx01, gy01), (gx, gy))
+                self._last_good_gaze = mapped
+                return mapped
 
         center = self._calib_center if self._calib_center is not None else (0.5, 0.5)
         gx01 = 0.5 + (gx - center[0]) * self.gain_x
@@ -733,8 +744,9 @@ class GazeTracker:
         gy01 = self._apply_deadzone(gy01)
         gx01 = self._apply_gamma(gx01)
         gy01 = self._apply_gamma(gy01)
-        mapped = (self._clamp01(gx01), self._clamp01(gy01))
-        return self._post_map_adjust(mapped, (gx, gy))
+        mapped = self._post_map_adjust((self._clamp01(gx01), self._clamp01(gy01)), (gx, gy))
+        self._last_good_gaze = mapped
+        return mapped
 
     def reset_calibration(self) -> None:
         """Clear all calibration data."""
@@ -1041,15 +1053,13 @@ class GazeTracker:
         # --- Fuse signals ---
         # Iris = precise but weak
         # Lid = strong but noisy
-        gy_raw = (
-            0.35 * v_norm +
-            0.65 * lid_norm
-        )
-
-        gy = float(np.clip(0.5 + gy_raw * self.vertical_gain, 0.0, 1.0))
-
         eye_height = max(abs(lower_y - upper_y), 1e-6)
         openness = float(eye_height / max(eye_width, 1e-6))
+        w_lid = float(np.clip((openness - 0.10) / (0.28 - 0.10), 0.0, 1.0))
+        w_lid = w_lid * w_lid
+        gy_raw = (1.0 - w_lid) * v_norm + w_lid * lid_norm
+
+        gy = float(np.clip(0.5 + gy_raw * self.vertical_gain, 0.0, 1.0))
 
         return {
             "gx": gx,
