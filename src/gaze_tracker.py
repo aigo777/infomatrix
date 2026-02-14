@@ -225,6 +225,7 @@ class GazeTracker:
                 "gaze_smooth": None,
                 "iris_radius": None,
                 "eye_openness": None,
+                "gaze_features": None,
                 "timestamp": timestamp,
             }
 
