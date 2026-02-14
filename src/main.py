@@ -65,6 +65,7 @@ def main() -> None:
     test_active = False
     test_start = 0.0
     test_duration = 1.0
+    show_pose_indices = False
 
     screen_w = None
     screen_h = None
@@ -207,6 +208,7 @@ def main() -> None:
         face_detected = bool(result.get("face_detected"))
         gaze_raw = result.get("gaze_raw_uncal")
         eye_open = result.get("eye_openness")
+        head_pose = result.get("head_pose")
         gaze_pointer = tracker.get_mapped_gaze(result)
 
         if isinstance(gaze_pointer, tuple):
@@ -278,9 +280,25 @@ def main() -> None:
                         name = calib_targets[calib_index][0]
                         calib_data[name] = (float(med[0]), float(med[1]))
                         target_xy = calib_targets[calib_index][2]
-                        train_X.append([float(med[0]), float(med[1])])
-                        train_Y.append([float(target_xy[0]), float(target_xy[1])])
-                        print(f"[ML] point {name}: X={train_X[-1]} -> Y={train_Y[-1]}")
+                        if isinstance(head_pose, dict):
+                            try:
+                                yaw = float(head_pose.get("yaw", 0.0))
+                                pitch = float(head_pose.get("pitch", 0.0))
+                                roll = float(head_pose.get("roll", 0.0))
+                                tz = float(head_pose.get("tz", 0.0))
+                                if not np.isfinite([yaw, pitch, roll, tz]).all():
+                                    yaw = pitch = roll = tz = None
+                            except (TypeError, ValueError):
+                                yaw = pitch = roll = tz = None
+                        else:
+                            yaw = pitch = roll = tz = None
+
+                        if yaw is not None:
+                            train_X.append([float(med[0]), float(med[1]), yaw, pitch, roll, tz])
+                            train_Y.append([float(target_xy[0]), float(target_xy[1])])
+                            print(f"[ML] point {name}: X={train_X[-1]} -> Y={train_Y[-1]}")
+                        else:
+                            print(f"[ML] point {name}: pose missing, skipping ML sample")
                         calib_open[name] = open_med
                         if name == "center":
                             center_open_list = opens[:]
@@ -353,6 +371,7 @@ def main() -> None:
                 calib_status = f"IN_PROGRESS {target_label} ({len(calib_samples)}/{calib_samples_needed})"
 
         result["calib_status"] = calib_status
+        result["show_pose_indices"] = show_pose_indices
         debug_frame = tracker.draw_debug(frame, result)
 
         cv2.putText(
@@ -610,8 +629,8 @@ def main() -> None:
                 calib_phase = "settle"
                 calib_index = 0
                 calib_phase_start = time.time()
-                train_X = []
-                train_Y = []
+            train_X = []
+            train_Y = []
             calib_samples = []
             calib_data = {}
             calib_quality = {}
@@ -687,6 +706,9 @@ def main() -> None:
         if key == ord("o"):
             y_offset = float(np.clip(y_offset + 0.01, -0.25, 0.25))
             print(f"y_offset={y_offset:.2f}")
+        if key == ord("p"):
+            show_pose_indices = not show_pose_indices
+            print(f"Pose index debug: {show_pose_indices}")
         if key == ord("y"):
             y_flip = not y_flip
             print(f"y_flip={y_flip}")

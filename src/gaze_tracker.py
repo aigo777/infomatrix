@@ -13,6 +13,16 @@ import numpy as np
 Point = Tuple[float, float]
 Gaze = Tuple[float, float]
 
+POSE_CANDIDATE_INDICES = [
+    1,      # often nose tip
+    2, 4,   # possible nose region
+    152,    # often chin
+    33,     # left eye outer
+    263,    # right eye outer
+    61,     # left mouth corner
+    291,    # right mouth corner
+]
+
 
 class OneEuroFilter:
     def __init__(self, min_cutoff: float = 1.0, beta: float = 0.0, d_cutoff: float = 1.0) -> None:
@@ -105,6 +115,14 @@ class GazeTracker:
     LEFT_LOWER_LID = [145, 153]
     RIGHT_UPPER_LID = [386, 387]
     RIGHT_LOWER_LID = [374, 373]
+    POSE_LANDMARKS = {
+        "nose_tip": 4,
+        "chin": 152,
+        "l_eye_outer": 33,
+        "r_eye_outer": 263,
+        "l_mouth": 61,
+        "r_mouth": 291,
+    }
 
     CALIB_TARGETS = ("center", "tl", "tr", "br", "bl")
     PANEL_TARGETS = {
@@ -229,12 +247,14 @@ class GazeTracker:
                 "gaze_smooth": None,
                 "iris_radius": None,
                 "eye_openness": None,
+                "head_pose": None,
                 "gaze_features": None,
                 "timestamp": timestamp,
             }
 
         face_landmarks = results.multi_face_landmarks[0].landmark
         landmarks_norm: List[Point] = [(lm.x, lm.y) for lm in face_landmarks]
+        head_pose = self._estimate_head_pose(landmarks_norm, w, h)
 
         left_iris_pts = [landmarks_norm[i] for i in self.LEFT_IRIS]
         right_iris_pts = [landmarks_norm[i] for i in self.RIGHT_IRIS]
@@ -303,6 +323,7 @@ class GazeTracker:
             "gaze_smooth": gaze_smooth,
             "iris_radius": iris_radius,
             "eye_openness": eye_openness,
+            "head_pose": head_pose,
             "gaze_features": gaze_features,
             "eye_width_px": eye_width_px,
             "face_confidence": face_confidence,
@@ -346,6 +367,8 @@ class GazeTracker:
         face_detected = bool(result_dict.get("face_detected"))
         points_px = result_dict.get("points_px") if face_detected else None
         iris_ring_px = result_dict.get("iris_ring_px") if face_detected else None
+        landmarks_norm = result_dict.get("landmarks_norm") if face_detected else None
+        head_pose = result_dict.get("head_pose") if face_detected else None
 
         if face_detected and isinstance(points_px, dict):
             self._draw_eye(
@@ -373,6 +396,24 @@ class GazeTracker:
             for pt in iris_ring_px.get("right", []):
                 cv2.circle(frame_bgr, pt, 2, (0, 0, 255), -1)
 
+        if result_dict.get("show_pose_indices", False) and isinstance(landmarks_norm, list):
+            h, w = frame_bgr.shape[:2]
+            for idx in POSE_CANDIDATE_INDICES:
+                if idx < len(landmarks_norm):
+                    x_norm, y_norm = landmarks_norm[idx]
+                    x_px = int(x_norm * w)
+                    y_px = int(y_norm * h)
+                    cv2.circle(frame_bgr, (x_px, y_px), 3, (255, 0, 255), -1)
+                    cv2.putText(
+                        frame_bgr,
+                        str(idx),
+                        (x_px + 5, y_px - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.4,
+                        (255, 0, 255),
+                        1,
+                    )
+
         gaze_raw = result_dict.get("gaze_raw_uncal")
         gaze_mapped = result_dict.get("gaze_mapped")
         gaze_smooth = result_dict.get("gaze_smooth")
@@ -398,6 +439,16 @@ class GazeTracker:
         map_y_text = "map_y=None"
         spans_text = "spans=None"
         piecewise_text = f"piecewise={'ON' if self._piecewise_ok else 'OFF'} edge=({self._edge_counter_x},{self._edge_counter_y})"
+        pose_text = "pose=None"
+        if isinstance(head_pose, dict):
+            try:
+                yaw = float(head_pose.get("yaw", 0.0))
+                pitch = float(head_pose.get("pitch", 0.0))
+                roll = float(head_pose.get("roll", 0.0))
+                tz = float(head_pose.get("tz", 0.0))
+                pose_text = f"pose ypr=({yaw:.1f},{pitch:.1f},{roll:.1f}) tz={tz:.1f}"
+            except (TypeError, ValueError):
+                pose_text = "pose=None"
         if self._map_x is not None:
             map_x_text = f"map_x=({self._map_x['L']:.3f},{self._map_x['C']:.3f},{self._map_x['R']:.3f})"
         if self._map_y is not None:
@@ -417,6 +468,7 @@ class GazeTracker:
             map_y_text,
             spans_text,
             piecewise_text,
+            pose_text,
             raw_text,
             mapped_text,
             smooth_text,
@@ -1104,6 +1156,91 @@ class GazeTracker:
 
     def _norm_to_px(self, pt: Point, w: int, h: int) -> Tuple[int, int]:
         return int(pt[0] * w), int(pt[1] * h)
+
+    def _estimate_head_pose(self, points_norm: List[Point], frame_w: int, frame_h: int) -> Optional[Dict[str, object]]:
+        if not isinstance(points_norm, list):
+            return None
+        required = list(self.POSE_LANDMARKS.values())
+        if not points_norm or max(required) >= len(points_norm):
+            return None
+
+        try:
+            image_points = np.array(
+                [
+                    self._norm_to_px(points_norm[self.POSE_LANDMARKS["nose_tip"]], frame_w, frame_h),
+                    self._norm_to_px(points_norm[self.POSE_LANDMARKS["chin"]], frame_w, frame_h),
+                    self._norm_to_px(points_norm[self.POSE_LANDMARKS["l_eye_outer"]], frame_w, frame_h),
+                    self._norm_to_px(points_norm[self.POSE_LANDMARKS["r_eye_outer"]], frame_w, frame_h),
+                    self._norm_to_px(points_norm[self.POSE_LANDMARKS["l_mouth"]], frame_w, frame_h),
+                    self._norm_to_px(points_norm[self.POSE_LANDMARKS["r_mouth"]], frame_w, frame_h),
+                ],
+                dtype=np.float32,
+            )
+        except (TypeError, ValueError, IndexError):
+            return None
+
+        model_points = np.array(
+            [
+                (0.0, 0.0, 0.0),
+                (0.0, -63.6, -12.5),
+                (-43.3, 32.7, -26.0),
+                (43.3, 32.7, -26.0),
+                (-28.9, -28.9, -24.1),
+                (28.9, -28.9, -24.1),
+            ],
+            dtype=np.float32,
+        )
+        f = float(frame_w)
+        cx = float(frame_w) * 0.5
+        cy = float(frame_h) * 0.5
+        camera_matrix = np.array(
+            [
+                [f, 0.0, cx],
+                [0.0, f, cy],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=np.float32,
+        )
+        dist_coeffs = np.zeros((4, 1), dtype=np.float32)
+
+        success, rvec, tvec = cv2.solvePnP(
+            model_points,
+            image_points,
+            camera_matrix,
+            dist_coeffs,
+            flags=cv2.SOLVEPNP_ITERATIVE,
+        )
+        if not success:
+            return None
+
+        rot_matrix, _ = cv2.Rodrigues(rvec)
+        pitch_deg, yaw_deg, roll_deg = self._rotationMatrixToEulerAngles(rot_matrix)
+        tvec_flat = tvec.reshape(-1)
+        if tvec_flat.size < 3:
+            return None
+        return {
+            "yaw": float(yaw_deg),
+            "pitch": float(pitch_deg),
+            "roll": float(roll_deg),
+            "tz": float(tvec_flat[2]),
+            "rvec": [float(x) for x in rvec.reshape(-1)],
+            "tvec": [float(x) for x in tvec_flat],
+        }
+
+    def _rotationMatrixToEulerAngles(self, rotation_matrix: np.ndarray) -> Tuple[float, float, float]:
+        sy = math.sqrt(rotation_matrix[0, 0] * rotation_matrix[0, 0] + rotation_matrix[1, 0] * rotation_matrix[1, 0])
+        singular = sy < 1e-6
+
+        if not singular:
+            pitch = math.atan2(rotation_matrix[2, 1], rotation_matrix[2, 2])
+            yaw = math.atan2(-rotation_matrix[2, 0], sy)
+            roll = math.atan2(rotation_matrix[1, 0], rotation_matrix[0, 0])
+        else:
+            pitch = math.atan2(-rotation_matrix[1, 2], rotation_matrix[1, 1])
+            yaw = math.atan2(-rotation_matrix[2, 0], sy)
+            roll = 0.0
+
+        return math.degrees(pitch), math.degrees(yaw), math.degrees(roll)
 
     def _format_gaze_text(self, label: str, gaze: Optional[Gaze]) -> str:
         if isinstance(gaze, tuple):
