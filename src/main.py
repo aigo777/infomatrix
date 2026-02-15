@@ -1,4 +1,5 @@
-﻿from __future__ import annotations
+from __future__ import annotations
+import argparse
 a=0
 import os
 import re
@@ -8,12 +9,26 @@ import math
 import cv2
 import numpy as np
 from gaze_tracker import GazeTracker
+from demo_ui import DemoUI, local_to_desktop_px, normalized_to_local_px
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="IrisKeys gaze demo")
+    parser.add_argument("--os-click", choices=("off", "on"), default="off")
+    parser.add_argument("--assist", choices=("off", "on"), default="off")
+    parser.add_argument("--drift", choices=("off", "on"), default="off")
+    return parser.parse_args()
 
 
 def main() -> None:
+    args = parse_args()
+    os_click_enabled = args.os_click == "on"
+    assist_enabled = args.assist == "on"
+    drift_enabled = args.drift == "on"
+
     print("IrisKeys - Stage 3.0")
     print(
-        "Controls: q quit | esc emergency stop | m toggle mouse | space pause | s screenshot | k calibrate | r reset | l load calibration | t test | [/] edge_gain | 9/0 y_edge_gain | i/k y_scale | o/l y_offset | y flip | ,/. spring_k"
+        "Controls: q quit | esc cancel armed | space confirm | p pause demo | m toggle mouse | s screenshot | k calibrate | r reset | l load calibration | t test | [/] edge_gain | 9/0 y_edge_gain | i/k y_scale | o/l y_offset | y flip | ,/. spring_k"
     )
 
     tracker = GazeTracker()
@@ -27,6 +42,10 @@ def main() -> None:
     debug_win = "IrisKeys Debug"
     pointer_win = "IrisKeys Pointer"
     cv2.namedWindow(pointer_win, cv2.WINDOW_NORMAL)
+    try:
+        cv2.setWindowProperty(pointer_win, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+    except cv2.error:
+        pass
     cv2.namedWindow(debug_win, cv2.WINDOW_NORMAL)
 
     calib_dir = os.path.join(os.getcwd(), "calibration")
@@ -109,6 +128,8 @@ def main() -> None:
     vw = None
     vh = None
     cursor_backend = "ctypes"
+    user32 = None
+    wintypes = None
 
     try:
         import ctypes
@@ -132,6 +153,11 @@ def main() -> None:
     if vw is None or vh is None or vw <= 0 or vh <= 0:
         vw = screen_w
         vh = screen_h
+
+    demo_ui: DemoUI | None = None
+    demo_drift_x = 0.0
+    demo_drift_y = 0.0
+    demo_drift_max = 0.006
 
     mouse_enabled = False
     mouse_paused = False
@@ -266,12 +292,35 @@ def main() -> None:
         return float(x0 + (x1 - x0) * frac), float(y0 + (y1 - y0) * frac)
 
     def get_cursor_pos() -> tuple[int, int]:
+        if user32 is None or wintypes is None:
+            return 0, 0
         pt = wintypes.POINT()
         user32.GetCursorPos(ctypes.byref(pt))
         return int(pt.x), int(pt.y)
 
     def set_cursor_pos(x_px: int, y_px: int) -> None:
+        if user32 is None:
+            return
         user32.SetCursorPos(int(x_px), int(y_px))
+
+    def os_left_click(x_px: int, y_px: int) -> bool:
+        if user32 is None:
+            return False
+        x0 = int(vx)
+        y0 = int(vy)
+        w_span = int(vw) if isinstance(vw, int) and vw > 0 else int(screen_w or 1)
+        h_span = int(vh) if isinstance(vh, int) and vh > 0 else int(screen_h or 1)
+        x1 = x0 + max(1, w_span) - 1
+        y1 = y0 + max(1, h_span) - 1
+        cx = int(np.clip(x_px, x0, x1))
+        cy = int(np.clip(y_px, y0, y1))
+        try:
+            user32.SetCursorPos(cx, cy)
+            user32.mouse_event(0x0002, 0, 0, 0, 0)  # LEFTDOWN
+            user32.mouse_event(0x0004, 0, 0, 0, 0)  # LEFTUP
+        except Exception:
+            return False
+        return True
 
     frame_times = deque(maxlen=30)
 
@@ -318,6 +367,10 @@ def main() -> None:
         if vw is None or vh is None or vw <= 0 or vh <= 0:
             vw = screen_w
             vh = screen_h
+        if demo_ui is None:
+            demo_ui = DemoUI(int(screen_w), int(screen_h), assist_on=assist_enabled)
+        else:
+            demo_ui.set_screen_size(int(screen_w), int(screen_h))
 
         now = time.time()
         if face_detected:
@@ -526,95 +579,54 @@ def main() -> None:
         cv2.imshow(debug_win, debug_frame)
 
         pointer_frame = np.zeros((screen_h, screen_w, 3), dtype=np.uint8)
-        if isinstance(display_gaze, tuple):
-            px = int(np.clip(display_gaze[0], 0.0, 1.0) * (screen_w - 1))
-            py = int(np.clip(display_gaze[1], 0.0, 1.0) * (screen_h - 1))
-            cv2.circle(pointer_frame, (px, py), 22, (255, 0, 0), -1)
-            label = f"{display_gaze[0]:.2f},{display_gaze[1]:.2f}"
-            cv2.putText(
-                pointer_frame,
-                label,
-                (min(px + 24, screen_w - 140), max(py - 24, 30)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                (255, 255, 255),
-                2,
+        demo_active = demo_ui is not None and tracker.has_full_calibration() and not calib_active
+        if demo_active and demo_ui is not None:
+            raw_local_px = None
+            raw_desktop_px = None
+            if isinstance(display_gaze, tuple):
+                gx, gy = clamp01(display_gaze[0]), clamp01(display_gaze[1])
+                raw_local_px = normalized_to_local_px((gx, gy), int(screen_w), int(screen_h))
+                raw_desktop_px = local_to_desktop_px(
+                    raw_local_px,
+                    int(screen_w),
+                    int(screen_h),
+                    int(vx),
+                    int(vy),
+                    int(vw),
+                    int(vh),
+                )
+
+            if drift_enabled and isinstance(display_gaze, tuple):
+                demo_drift_rate = 0.0005
+                demo_drift_x = float(
+                    np.clip(demo_drift_x + (display_gaze[0] - 0.5) * demo_drift_rate, -demo_drift_max, demo_drift_max)
+                )
+                demo_drift_y = float(
+                    np.clip(demo_drift_y + (display_gaze[1] - 0.5) * demo_drift_rate, -demo_drift_max, demo_drift_max)
+                )
+            else:
+                demo_drift_x *= 0.95
+                demo_drift_y *= 0.95
+
+            drift_px = (
+                int(round(demo_drift_x * max(1, int(screen_w) - 1))),
+                int(round(demo_drift_y * max(1, int(screen_h) - 1))),
             )
+            demo_ui.set_assist_enabled(assist_enabled)
+            demo_ui.update(
+                int(now * 1000.0),
+                raw_local_px,
+                drift_offset_px=drift_px,
+                face_detected=face_detected,
+                raw_desktop_px=raw_desktop_px,
+            )
+            demo_ui.render(pointer_frame, int(now * 1000.0))
+        elif test_active:
+            if isinstance(display_gaze, tuple):
+                px = int(np.clip(display_gaze[0], 0.0, 1.0) * (screen_w - 1))
+                py = int(np.clip(display_gaze[1], 0.0, 1.0) * (screen_h - 1))
+                cv2.circle(pointer_frame, (px, py), 18, (255, 0, 0), -1)
 
-        flip_text = f"flipX={tracker.axis_flip_x} flipY={tracker.axis_flip_y}"
-        cv2.putText(
-            pointer_frame,
-            flip_text,
-            (20, screen_h - 20),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (255, 255, 255),
-            2,
-        )
-        alpha_text = f"spring_k={spring_k:.0f} edge={edge_gain:.2f}"
-        cv2.putText(
-            pointer_frame,
-            alpha_text,
-            (screen_w - 160, screen_h - 20),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (255, 255, 255),
-            2,
-        )
-        open_val = f"{eye_open:.3f}" if isinstance(eye_open, float) else "None"
-        ref_val = f"{tracker._open_ref:.3f}" if isinstance(tracker._open_ref, float) else "None"
-        open_text = f"open={open_val} ref={ref_val} beta_y={tracker._open_beta_y:.4f}"
-        y_text = f"y_scale={y_scale:.2f} y_off={y_offset:.2f} y_edge={y_edge_gain:.2f} flip={y_flip}"
-        cv2.putText(
-            pointer_frame,
-            y_text,
-            (20, screen_h - 80),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (255, 255, 255),
-            2,
-        )
-        cv2.putText(
-            pointer_frame,
-            open_text,
-            (20, screen_h - 105),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (255, 255, 255),
-            2,
-        )
-        status_text = f"mouse={'ON' if mouse_enabled else 'OFF'} {cursor_backend}"
-        cv2.putText(
-            pointer_frame,
-            status_text,
-            (20, screen_h - 50),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (255, 255, 255),
-            2,
-        )
-        desktop_text = f"desktop=({vx},{vy},{vw},{vh})"
-        target_text = f"target=({target_x},{target_y})"
-        cv2.putText(
-            pointer_frame,
-            desktop_text,
-            (20, 30),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (255, 255, 255),
-            2,
-        )
-        cv2.putText(
-            pointer_frame,
-            target_text,
-            (20, 55),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (255, 255, 255),
-            2,
-        )
-
-        if test_active:
             elapsed = time.time() - test_start
             if elapsed >= test_duration * 2:
                 test_active = False
@@ -633,10 +645,10 @@ def main() -> None:
                 trans_text = "gy2=None"
                 if isinstance(display_gaze, tuple):
                     trans_text = f"gy2={display_gaze[1]:.3f}"
-                target_text = f"target_y={target_y}"
+                y_target_text = f"target_y={target_y}"
                 cv2.putText(
                     pointer_frame,
-                    f"{label} {raw_text} {trans_text} {target_text}",
+                    f"{label} {raw_text} {trans_text} {y_target_text}",
                     (20, 60),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.9,
@@ -701,6 +713,10 @@ def main() -> None:
                 (255, 255, 255),
                 2,
             )
+            if isinstance(display_gaze, tuple):
+                px = int(np.clip(display_gaze[0], 0.0, 1.0) * (screen_w - 1))
+                py = int(np.clip(display_gaze[1], 0.0, 1.0) * (screen_h - 1))
+                cv2.circle(pointer_frame, (px, py), 16, (255, 0, 0), -1)
 
         cv2.imshow(pointer_win, pointer_frame)
 
@@ -749,9 +765,12 @@ def main() -> None:
         if key == ord("q"):
             break
         if key == 27:
-            mouse_enabled = False
-            print("Emergency stop.")
-            break
+            if demo_active and demo_ui is not None:
+                demo_ui.cancel_armed()
+                print("Armed selection canceled.")
+            else:
+                mouse_enabled = False
+                print("Mouse control canceled.")
         if key == ord("s"):
             filename = time.strftime("screenshot_%Y%m%d_%H%M%S.png")
             path = os.path.join(os.getcwd(), filename)
@@ -835,7 +854,28 @@ def main() -> None:
                     vy_c = 0.0
                 print(f"Mouse control {'enabled' if mouse_enabled else 'disabled'}.")
         if key == ord(" "):
-            mouse_paused = not mouse_paused
+            if demo_active and demo_ui is not None:
+                event = demo_ui.confirm(int(now * 1000.0))
+                if event.get("type") == "success":
+                    if os_click_enabled:
+                        click_pt = event.get("click_px")
+                        if isinstance(click_pt, tuple) and len(click_pt) == 2:
+                            desktop_click = local_to_desktop_px(
+                                (int(click_pt[0]), int(click_pt[1])),
+                                int(screen_w),
+                                int(screen_h),
+                                int(vx),
+                                int(vy),
+                                int(vw),
+                                int(vh),
+                            )
+                            did_click = os_left_click(int(desktop_click[0]), int(desktop_click[1]))
+                            if not did_click:
+                                print("OS click failed (backend unavailable).")
+                elif event.get("type") == "false_select":
+                    pass
+            else:
+                mouse_paused = not mouse_paused
         if key == ord("["):
             edge_gain = float(np.clip(edge_gain + 0.02, 0.0, 0.5))
             print(f"edge_gain={edge_gain:.2f}")
@@ -855,8 +895,12 @@ def main() -> None:
             y_offset = float(np.clip(y_offset + 0.01, -0.25, 0.25))
             print(f"y_offset={y_offset:.2f}")
         if key == ord("p"):
-            show_pose_indices = not show_pose_indices
-            print(f"Pose index debug: {show_pose_indices}")
+            if demo_active and demo_ui is not None:
+                paused_now = demo_ui.toggle_pause()
+                print(f"Demo pause {'ON' if paused_now else 'OFF'}.")
+            else:
+                show_pose_indices = not show_pose_indices
+                print(f"Pose index debug: {show_pose_indices}")
         if key == ord("y"):
             y_flip = not y_flip
             print(f"y_flip={y_flip}")
