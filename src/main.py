@@ -28,7 +28,7 @@ def main() -> None:
 
     print("IrisKeys - Stage 3.0")
     print(
-        "Controls: q quit | esc cancel armed | space confirm | p pause demo | m toggle mouse | s screenshot | k calibrate | r reset | l load calibration | t test | [/] edge_gain | 9/0 y_edge_gain | i/k y_scale | o/l y_offset | y flip | ,/. spring_k"
+        "Controls: q quit | esc cancel armed | space confirm | p pause demo | m toggle mouse | b toggle blink-click | s screenshot | k calibrate | r reset | l load calibration | t test | [/] edge_gain | 9/0 y_edge_gain | i/k y_scale | o/l y_offset | y flip | ,/. spring_k"
     )
 
     tracker = GazeTracker()
@@ -181,6 +181,20 @@ def main() -> None:
     y_offset = 0.0
     y_flip = False
     y_edge_gain = 0.18
+    blink_enabled = True
+    blink_closed = False
+    blink_down_ts = 0.0
+    last_click_ts = 0.0
+    open_ref: float | None = None
+    open_ref_samples = deque(maxlen=30)
+
+    BLINK_CLOSE_RATIO = 0.55
+    BLINK_OPEN_RATIO = 0.80
+    BLINK_MIN_HOLD_S = 0.10
+    CLICK_COOLDOWN_S = 0.65
+    BASELINE_UPDATE_VEL = 0.015
+    BASELINE_MIN = 0.10
+    BASELINE_MAX = 0.65
 
     print("Cursor backend: ctypes")
 
@@ -322,6 +336,51 @@ def main() -> None:
             return False
         return True
 
+    def send_left_click() -> bool:
+        if user32 is None:
+            return False
+        try:
+            if ctypes is None:
+                raise RuntimeError("ctypes unavailable")
+
+            if wintypes is None:
+                raise RuntimeError("wintypes unavailable")
+
+            class MOUSEINPUT(ctypes.Structure):
+                _fields_ = [
+                    ("dx", wintypes.LONG),
+                    ("dy", wintypes.LONG),
+                    ("mouseData", wintypes.DWORD),
+                    ("dwFlags", wintypes.DWORD),
+                    ("time", wintypes.DWORD),
+                    ("dwExtraInfo", wintypes.ULONG_PTR),
+                ]
+
+            class INPUT(ctypes.Structure):
+                class _INPUT_UNION(ctypes.Union):
+                    _fields_ = [("mi", MOUSEINPUT)]
+
+                _anonymous_ = ("u",)
+                _fields_ = [("type", wintypes.DWORD), ("u", _INPUT_UNION)]
+
+            INPUT_MOUSE = 0
+            MOUSEEVENTF_LEFTDOWN = 0x0002
+            MOUSEEVENTF_LEFTUP = 0x0004
+
+            down = INPUT(type=INPUT_MOUSE, mi=MOUSEINPUT(0, 0, 0, MOUSEEVENTF_LEFTDOWN, 0, 0))
+            up = INPUT(type=INPUT_MOUSE, mi=MOUSEINPUT(0, 0, 0, MOUSEEVENTF_LEFTUP, 0, 0))
+            sent = user32.SendInput(2, ctypes.byref((INPUT * 2)(down, up)), ctypes.sizeof(INPUT))
+            if int(sent) == 2:
+                return True
+            raise RuntimeError(f"SendInput returned {sent}")
+        except Exception:
+            try:
+                user32.mouse_event(0x0002, 0, 0, 0, 0)  # LEFTDOWN
+                user32.mouse_event(0x0004, 0, 0, 0, 0)  # LEFTUP
+                return True
+            except Exception:
+                return False
+
     frame_times = deque(maxlen=30)
 
     while True:
@@ -378,6 +437,7 @@ def main() -> None:
             lost_frames = 0
         else:
             lost_frames += 1
+            blink_closed = False
             if now - last_face_time > 0.25 and mouse_enabled:
                 mouse_enabled = False
                 sx = None
@@ -511,6 +571,23 @@ def main() -> None:
                 calib_phase = "idle"
                 pursuit_target_xy = None
 
+        should_update_baseline = (
+            face_detected
+            and isinstance(eye_open, float)
+            and mouse_enabled
+            and not mouse_paused
+            and not calib_active
+            and tracker.has_full_calibration()
+        )
+        vel = tracker._last_velocity
+        if should_update_baseline and vel is not None and vel < BASELINE_UPDATE_VEL:
+            eye_open_val = float(eye_open)
+            if np.isfinite(eye_open_val):
+                open_ref_samples.append(eye_open_val)
+                if len(open_ref_samples) >= 10:
+                    med_open = float(np.median(np.array(open_ref_samples, dtype=np.float32)))
+                    open_ref = float(np.clip(med_open, BASELINE_MIN, BASELINE_MAX))
+
         frame_times.append(now)
         fps = 0.0
         if len(frame_times) >= 2:
@@ -573,6 +650,28 @@ def main() -> None:
             cv2.FONT_HERSHEY_SIMPLEX,
             0.6,
             (0, 255, 0),
+            2,
+        )
+        eye_open_text = f"{float(eye_open):.3f}" if isinstance(eye_open, float) else "None"
+        open_ref_text = f"{open_ref:.3f}" if open_ref is not None else "None"
+        blink_text = f"blink={'ON' if blink_enabled else 'OFF'} closed={blink_closed}"
+        blink_ref_text = f"eye={eye_open_text} ref={open_ref_text}"
+        cv2.putText(
+            debug_frame,
+            blink_text,
+            (10, 24),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (0, 220, 255),
+            2,
+        )
+        cv2.putText(
+            debug_frame,
+            blink_ref_text,
+            (10, 46),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (0, 220, 255),
             2,
         )
 
@@ -808,6 +907,36 @@ def main() -> None:
                 print(f"Mouse control error: {exc}")
                 mouse_enabled = False
 
+        can_detect_blink = (
+            blink_enabled
+            and mouse_enabled
+            and not mouse_paused
+            and tracker.has_full_calibration()
+            and not calib_active
+            and face_detected
+            and isinstance(eye_open, float)
+            and open_ref is not None
+        )
+        if not face_detected:
+            blink_closed = False
+        elif can_detect_blink:
+            eye_open_val = float(eye_open)
+            closed_now = eye_open_val < float(open_ref) * BLINK_CLOSE_RATIO
+            open_now = eye_open_val > float(open_ref) * BLINK_OPEN_RATIO
+
+            if not blink_closed and closed_now:
+                blink_closed = True
+                blink_down_ts = now
+            elif blink_closed and open_now:
+                duration = now - blink_down_ts
+                blink_closed = False
+                if duration >= BLINK_MIN_HOLD_S and (now - last_click_ts) >= CLICK_COOLDOWN_S:
+                    send_left_click()
+                    last_click_ts = now
+        else:
+            if not mouse_enabled or mouse_paused or calib_active:
+                blink_closed = False
+
         key = cv2.waitKey(1) & 0xFF
         if key == ord("q"):
             break
@@ -893,6 +1022,7 @@ def main() -> None:
                 print("Mouse control disabled during calibration.")
             else:
                 mouse_enabled = not mouse_enabled
+                blink_closed = False
                 if mouse_enabled:
                     cx, cy = get_cursor_pos()
                     sx = float(cx)
@@ -900,6 +1030,10 @@ def main() -> None:
                     vx_c = 0.0
                     vy_c = 0.0
                 print(f"Mouse control {'enabled' if mouse_enabled else 'disabled'}.")
+        if key == ord("b"):
+            blink_enabled = not blink_enabled
+            blink_closed = False
+            print(f"Blink click {'enabled' if blink_enabled else 'disabled'}.")
         if key == ord(" "):
             if demo_active and demo_ui is not None:
                 event = demo_ui.confirm(int(now * 1000.0))
