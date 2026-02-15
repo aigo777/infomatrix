@@ -631,14 +631,24 @@ def main() -> None:
                 and len(assist_local) == 2
             )
             if assist_valid:
-                dx = float(assist_local[0] - raw_local_px[0])
-                dy = float(assist_local[1] - raw_local_px[1])
+                try:
+                    ax_l = int(round(float(assist_local[0])))
+                    ay_l = int(round(float(assist_local[1])))
+                except (TypeError, ValueError):
+                    ax_l = None
+                    ay_l = None
+                if ax_l is None or ay_l is None:
+                    assist_valid = False
+
+            if assist_valid:
+                dx = float(ax_l - raw_local_px[0])
+                dy = float(ay_l - raw_local_px[1])
                 dist = (dx * dx + dy * dy) ** 0.5
 
                 SNAP_R = 90.0
                 if dist <= SNAP_R:
                     ax, ay = local_to_desktop_px(
-                        (int(assist_local[0]), int(assist_local[1])),
+                        (ax_l, ay_l),
                         int(screen_w),
                         int(screen_h),
                         int(vx),
@@ -648,7 +658,7 @@ def main() -> None:
                     )
                     target_x, target_y = int(ax), int(ay)
 
-                    cv2.circle(pointer_frame, (int(assist_local[0]), int(assist_local[1])), 6, (0, 255, 0), -1)
+                    cv2.circle(pointer_frame, (ax_l, ay_l), 6, (0, 255, 0), -1)
                     cv2.putText(
                         pointer_frame,
                         f"ASSIST dist={dist:.0f}",
