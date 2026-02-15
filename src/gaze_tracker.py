@@ -44,6 +44,11 @@ MODEL_POINTS_3D = np.array(
     dtype=np.float32,
 )
 
+POSE_SMOOTH_MIN_CUTOFF = 0.8
+POSE_SMOOTH_BETA = 0.02
+POSE_SMOOTH_D_CUTOFF = 1.0
+POSE_HOLD_MS = 150
+
 
 class OneEuroFilter:
     def __init__(self, min_cutoff: float = 1.0, beta: float = 0.0, d_cutoff: float = 1.0) -> None:
@@ -226,6 +231,7 @@ class GazeTracker:
 
         self._last_raw: Optional[Gaze] = None
         self._last_mapped: Optional[Gaze] = None
+        self._reset_pose_filters()
 
         self._mp_face_mesh = mp.solutions.face_mesh
         self._face_mesh = self._mp_face_mesh.FaceMesh(
@@ -249,6 +255,7 @@ class GazeTracker:
             self._last_raw = None
             self._last_mapped = None
             self._last_openness = None
+            self._reset_pose_filters()
             return {
                 "face_detected": False,
                 "landmarks_norm": None,
@@ -261,13 +268,15 @@ class GazeTracker:
                 "iris_radius": None,
                 "eye_openness": None,
                 "head_pose": None,
+                "head_pose_raw": None,
                 "gaze_features": None,
                 "timestamp": timestamp,
             }
 
         face_landmarks = results.multi_face_landmarks[0].landmark
         landmarks_norm: List[Point] = [(lm.x, lm.y) for lm in face_landmarks]
-        head_pose = self._estimate_head_pose(landmarks_norm, w, h)
+        head_pose_raw = self._estimate_head_pose(landmarks_norm, w, h)
+        head_pose = self._smooth_head_pose(head_pose_raw, timestamp)
 
         left_iris_pts = [landmarks_norm[i] for i in self.LEFT_IRIS]
         right_iris_pts = [landmarks_norm[i] for i in self.RIGHT_IRIS]
@@ -337,6 +346,7 @@ class GazeTracker:
             "iris_radius": iris_radius,
             "eye_openness": eye_openness,
             "head_pose": head_pose,
+            "head_pose_raw": head_pose_raw,
             "gaze_features": gaze_features,
             "eye_width_px": eye_width_px,
             "face_confidence": face_confidence,
@@ -1169,6 +1179,67 @@ class GazeTracker:
 
     def _norm_to_px(self, pt: Point, w: int, h: int) -> Tuple[int, int]:
         return int(pt[0] * w), int(pt[1] * h)
+
+    def _reset_pose_filters(self) -> None:
+        self._pose_filt_yaw = OneEuroFilter(
+            min_cutoff=POSE_SMOOTH_MIN_CUTOFF,
+            beta=POSE_SMOOTH_BETA,
+            d_cutoff=POSE_SMOOTH_D_CUTOFF,
+        )
+        self._pose_filt_pitch = OneEuroFilter(
+            min_cutoff=POSE_SMOOTH_MIN_CUTOFF,
+            beta=POSE_SMOOTH_BETA,
+            d_cutoff=POSE_SMOOTH_D_CUTOFF,
+        )
+        self._pose_filt_roll = OneEuroFilter(
+            min_cutoff=POSE_SMOOTH_MIN_CUTOFF,
+            beta=POSE_SMOOTH_BETA,
+            d_cutoff=POSE_SMOOTH_D_CUTOFF,
+        )
+        self._pose_filt_tz = OneEuroFilter(
+            min_cutoff=POSE_SMOOTH_MIN_CUTOFF,
+            beta=POSE_SMOOTH_BETA,
+            d_cutoff=POSE_SMOOTH_D_CUTOFF,
+        )
+        self._pose_last_valid_ts = None
+        self._pose_last_smoothed = None
+
+    def _smooth_head_pose(self, raw_pose: Optional[Dict[str, float]], t: float) -> Optional[Dict[str, float]]:
+        def hold_pose() -> Optional[Dict[str, float]]:
+            if self._pose_last_valid_ts is None or self._pose_last_smoothed is None:
+                return None
+            if t - self._pose_last_valid_ts <= POSE_HOLD_MS / 1000.0:
+                return self._pose_last_smoothed
+            return None
+
+        if raw_pose is None:
+            return hold_pose()
+
+        try:
+            yaw = float(raw_pose["yaw"])
+            pitch = float(raw_pose["pitch"])
+            roll = float(raw_pose["roll"])
+            tz = float(raw_pose["tz"])
+        except (TypeError, ValueError, KeyError):
+            return hold_pose()
+
+        if not np.isfinite([yaw, pitch, roll, tz]).all():
+            return hold_pose()
+
+        yaw_s = self._pose_filt_yaw.filter(yaw, t)
+        pitch_s = self._pose_filt_pitch.filter(pitch, t)
+        roll_s = self._pose_filt_roll.filter(roll, t)
+        tz_s = self._pose_filt_tz.filter(tz, t)
+
+        smoothed = {
+            "yaw": float(yaw_s),
+            "pitch": float(pitch_s),
+            "roll": float(roll_s),
+            "tz": float(tz_s),
+        }
+        self._pose_last_valid_ts = t
+        self._pose_last_smoothed = smoothed
+        return smoothed
 
     def _estimate_head_pose(
         self,
