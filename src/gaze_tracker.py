@@ -235,6 +235,8 @@ class GazeTracker:
 
         self._last_raw: Optional[Gaze] = None
         self._last_mapped: Optional[Gaze] = None
+        self._pose_prev: Optional[Tuple[float, float, float]] = None
+        self._pose_unwrap_debug = False
         self._reset_pose_filters()
         self._clear_ml_calibration()
 
@@ -1501,9 +1503,35 @@ class GazeTracker:
         if not np.isfinite([yaw_deg, pitch_deg, roll_deg]).all():
             return None
 
+        raw_yaw_deg = float(yaw_deg)
+        raw_pitch_deg = float(pitch_deg)
+        raw_roll_deg = float(roll_deg)
+        if self._pose_prev is not None:
+            raw_delta_yaw = raw_yaw_deg - self._pose_prev[0]
+            raw_delta_pitch = raw_pitch_deg - self._pose_prev[1]
+            raw_delta_roll = raw_roll_deg - self._pose_prev[2]
+            yaw_deg = self._unwrap_deg(raw_yaw_deg, self._pose_prev[0])
+            pitch_deg = self._unwrap_deg(raw_pitch_deg, self._pose_prev[1])
+            roll_deg = self._unwrap_deg(raw_roll_deg, self._pose_prev[2])
+            if (
+                self._pose_unwrap_debug
+                and (
+                    abs(raw_delta_yaw) > 200.0
+                    or abs(raw_delta_pitch) > 200.0
+                    or abs(raw_delta_roll) > 200.0
+                )
+            ):
+                print(
+                    "[pose-unwrap] raw ypr="
+                    f"({raw_yaw_deg:.1f},{raw_pitch_deg:.1f},{raw_roll_deg:.1f}) "
+                    f"prev=({self._pose_prev[0]:.1f},{self._pose_prev[1]:.1f},{self._pose_prev[2]:.1f}) "
+                    f"unwrapped=({yaw_deg:.1f},{pitch_deg:.1f},{roll_deg:.1f})"
+                )
+
         tvec_flat = tvec.reshape(-1)
         if tvec_flat.size < 3 or not np.isfinite(tvec_flat[2]):
             return None
+        self._pose_prev = (float(yaw_deg), float(pitch_deg), float(roll_deg))
 
         return {
             "yaw": float(yaw_deg),
@@ -1511,6 +1539,16 @@ class GazeTracker:
             "roll": float(roll_deg),
             "tz": float(tvec_flat[2]),
         }
+
+    def _unwrap_deg(self, curr: float, prev: float) -> float:
+        delta = curr - prev
+        while delta > 180.0:
+            curr -= 360.0
+            delta = curr - prev
+        while delta < -180.0:
+            curr += 360.0
+            delta = curr - prev
+        return curr
 
     def _rotationMatrixToEulerAngles(self, rotation_matrix: np.ndarray) -> Tuple[float, float, float]:
         if rotation_matrix.shape != (3, 3):
