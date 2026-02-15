@@ -10,6 +10,8 @@ import cv2
 import mediapipe as mp
 import numpy as np
 
+from calibration import Calibrator
+
 Point = Tuple[float, float]
 Gaze = Tuple[float, float]
 
@@ -48,6 +50,8 @@ POSE_SMOOTH_MIN_CUTOFF = 0.8
 POSE_SMOOTH_BETA = 0.02
 POSE_SMOOTH_D_CUTOFF = 1.0
 POSE_HOLD_MS = 150
+ML_FEATURE_ORDER = ("gx", "gy", "yaw", "pitch", "roll", "tz")
+ML_MODEL_VERSION = 1
 
 
 class OneEuroFilter:
@@ -232,6 +236,7 @@ class GazeTracker:
         self._last_raw: Optional[Gaze] = None
         self._last_mapped: Optional[Gaze] = None
         self._reset_pose_filters()
+        self._clear_ml_calibration()
 
         self._mp_face_mesh = mp.solutions.face_mesh
         self._face_mesh = self._mp_face_mesh.FaceMesh(
@@ -255,6 +260,7 @@ class GazeTracker:
             self._last_raw = None
             self._last_mapped = None
             self._last_openness = None
+            self._last_head_pose_for_ml = None
             self._reset_pose_filters()
             return {
                 "face_detected": False,
@@ -277,6 +283,7 @@ class GazeTracker:
         landmarks_norm: List[Point] = [(lm.x, lm.y) for lm in face_landmarks]
         head_pose_raw = self._estimate_head_pose(landmarks_norm, w, h)
         head_pose = self._smooth_head_pose(head_pose_raw, timestamp)
+        self._last_head_pose_for_ml = head_pose
 
         left_iris_pts = [landmarks_norm[i] for i in self.LEFT_IRIS]
         right_iris_pts = [landmarks_norm[i] for i in self.RIGHT_IRIS]
@@ -385,6 +392,152 @@ class GazeTracker:
         self._open_ref = float(open_ref)
         self._open_beta_y = float(beta_y)
 
+    def is_ml_ready(self) -> bool:
+        return bool(self._ml_ready and self._ml_calibrator is not None)
+
+    def _clear_ml_calibration(self) -> None:
+        self._ml_calibrator: Optional[Calibrator] = None
+        self._ml_ready = False
+        self._ml_feature_order = ML_FEATURE_ORDER
+        self._last_head_pose_for_ml: Optional[Dict[str, float]] = None
+        self._ml_meta: Dict[str, object] = {
+            "ready": False,
+            "user_id": None,
+            "model_file": None,
+            "feature_order": list(ML_FEATURE_ORDER),
+            "alpha": None,
+            "version": ML_MODEL_VERSION,
+        }
+
+    def _build_ml_features(self, gaze_raw: Gaze, head_pose: Optional[Dict[str, float]]) -> Optional[np.ndarray]:
+        if head_pose is None:
+            return None
+
+        try:
+            gx = float(gaze_raw[0])
+            gy = float(gaze_raw[1])
+            yaw = float(head_pose["yaw"])
+            pitch = float(head_pose["pitch"])
+            roll = float(head_pose["roll"])
+            tz = float(head_pose["tz"])
+        except (KeyError, TypeError, ValueError):
+            return None
+
+        features = np.array([gx, gy, yaw, pitch, roll, tz], dtype=np.float32)
+        if not np.isfinite(features).all():
+            return None
+        return features
+
+    def fit_ml_calibration(
+        self,
+        X: List[List[float]],
+        Y: List[List[float]],
+        alpha: float = 0.5,
+    ) -> bool:
+        calibrator = Calibrator(feature_order=self._ml_feature_order)
+        if not calibrator.fit(X, Y, alpha=alpha):
+            return False
+
+        self._ml_calibrator = calibrator
+        self._ml_ready = True
+        self._ml_meta = {
+            "ready": True,
+            "user_id": self._ml_meta.get("user_id"),
+            "model_file": self._ml_meta.get("model_file"),
+            "feature_order": list(calibrator.feature_order),
+            "alpha": float(calibrator.alpha),
+            "version": int(calibrator.version),
+        }
+        return True
+
+    def predict_ml_gaze(self, features: np.ndarray) -> Optional[Gaze]:
+        if not self.is_ml_ready() or self._ml_calibrator is None:
+            return None
+        try:
+            pred = self._ml_calibrator.predict(features.reshape(1, -1))
+        except (ValueError, TypeError):
+            return None
+        if pred.shape != (1, 2):
+            return None
+        px = float(pred[0, 0])
+        py = float(pred[0, 1])
+        if not np.isfinite([px, py]).all():
+            return None
+        return self._clamp01(px), self._clamp01(py)
+
+    def save_ml_model(self, model_path: str, user_id: Optional[str] = None) -> bool:
+        if not self.is_ml_ready() or self._ml_calibrator is None:
+            return False
+
+        try:
+            self._ml_calibrator.save_npz(model_path)
+        except (OSError, ValueError):
+            return False
+
+        self._ml_meta = {
+            "ready": True,
+            "user_id": user_id,
+            "model_file": os.path.basename(model_path),
+            "feature_order": list(self._ml_calibrator.feature_order),
+            "alpha": float(self._ml_calibrator.alpha),
+            "version": int(self._ml_calibrator.version),
+        }
+        return True
+
+    def load_ml_model(self, model_path: str, user_id: Optional[str] = None) -> bool:
+        if not os.path.exists(model_path):
+            return False
+
+        try:
+            calibrator = Calibrator.load_npz(model_path)
+        except (OSError, ValueError, KeyError):
+            self._clear_ml_calibration()
+            return False
+
+        self._ml_calibrator = calibrator
+        self._ml_ready = True
+        self._ml_meta = {
+            "ready": True,
+            "user_id": user_id,
+            "model_file": os.path.basename(model_path),
+            "feature_order": list(calibrator.feature_order),
+            "alpha": float(calibrator.alpha),
+            "version": int(calibrator.version),
+        }
+        return True
+
+    def _load_ml_from_json(self, data: Dict[str, object], calib_path: str) -> None:
+        self._clear_ml_calibration()
+
+        ml_data = data.get("ml")
+        if not isinstance(ml_data, dict):
+            return
+        if not bool(ml_data.get("ready", False)):
+            return
+
+        model_file = ml_data.get("model_file")
+        if not isinstance(model_file, str) or not model_file:
+            return
+
+        model_path = model_file
+        if not os.path.isabs(model_path):
+            model_path = os.path.join(os.path.dirname(calib_path), model_file)
+
+        user_id = ml_data.get("user_id")
+        user_id_str = str(user_id) if isinstance(user_id, str) else None
+        if not self.load_ml_model(model_path, user_id=user_id_str):
+            return
+
+        feature_order = ml_data.get("feature_order")
+        if isinstance(feature_order, list) and all(isinstance(v, str) for v in feature_order):
+            self._ml_meta["feature_order"] = feature_order
+        alpha = ml_data.get("alpha")
+        if isinstance(alpha, (int, float)):
+            self._ml_meta["alpha"] = float(alpha)
+        version = ml_data.get("version")
+        if isinstance(version, int):
+            self._ml_meta["version"] = version
+
     def draw_debug(self, frame_bgr: np.ndarray, result_dict: Dict[str, object]) -> np.ndarray:
         """Draw eye landmarks, gaze text, and a virtual screen panel."""
         face_detected = bool(result_dict.get("face_detected"))
@@ -456,6 +609,11 @@ class GazeTracker:
             calib_text = f"calib={calib_override}"
         else:
             calib_text = f"calib={self._calib_status_text()}"
+        ml_override = result_dict.get("ml_status")
+        if isinstance(ml_override, str):
+            ml_text = f"ml={ml_override}"
+        else:
+            ml_text = f"ml={'ON' if self.is_ml_ready() else 'OFF'}"
         gain_text = f"gain=({self.gain_x:.2f},{self.gain_y:.2f})"
         alpha_text = f"alpha={self._last_alpha:.2f} cutoff={self._last_cutoff:.2f} vel={self._last_velocity:.3f}"
         map_x_text = "map_x=None"
@@ -486,6 +644,7 @@ class GazeTracker:
             face_text,
             mirror_text,
             calib_text,
+            ml_text,
             f"{gain_text} {alpha_text}",
             map_x_text,
             map_y_text,
@@ -644,10 +803,18 @@ class GazeTracker:
 
     def save_calibration(self, path: str) -> bool:
         """Save calibration data to disk."""
-        print("Vertical span:", self._calib_range[3] - self._calib_range[2])
+        if self._calib_range is not None:
+            print("Vertical span:", self._calib_range[3] - self._calib_range[2])
         if self._calib_range is None and not self._calib:
             return False
-        
+        ml_model_file = self._ml_meta.get("model_file")
+        ml_ready_for_save = bool(
+            self._ml_meta.get("ready", False)
+            and self.is_ml_ready()
+            and isinstance(ml_model_file, str)
+            and ml_model_file
+        )
+
         os.makedirs(os.path.dirname(path), exist_ok=True)
         data = {
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -663,6 +830,14 @@ class GazeTracker:
                 "d_cutoff": self._one_euro.fx.d_cutoff,
             },
             "range": None,
+            "ml": {
+                "ready": ml_ready_for_save,
+                "user_id": self._ml_meta.get("user_id"),
+                "model_file": ml_model_file,
+                "feature_order": self._ml_meta.get("feature_order", list(ML_FEATURE_ORDER)),
+                "alpha": self._ml_meta.get("alpha"),
+                "version": self._ml_meta.get("version", ML_MODEL_VERSION),
+            },
         }
 
         if self._calib_range is not None:
@@ -758,8 +933,14 @@ class GazeTracker:
                 self._gaze_smooth = None
                 self._gaze_window.clear()
                 self._last_gaze_time = None
-                return self._calib_range is not None
-            return self.set_full_calibration(parsed, pad=pad)
+                ok = self._calib_range is not None
+                if ok:
+                    self._load_ml_from_json(data, path)
+                return ok
+            ok = self.set_full_calibration(parsed, pad=pad)
+            if ok:
+                self._load_ml_from_json(data, path)
+            return ok
 
         rng = data.get("range")
         if isinstance(rng, dict):
@@ -783,6 +964,7 @@ class GazeTracker:
             self._gaze_smooth = None
             self._gaze_window.clear()
             self._last_gaze_time = None
+            self._load_ml_from_json(data, path)
             return True
 
         return False
@@ -801,6 +983,14 @@ class GazeTracker:
         gx, gy = gaze_raw
         # Openness is kept for diagnostics only; it does not shift gaze.
         gx, gy = self.apply_axis_flip((gx, gy))
+
+        if self.is_ml_ready():
+            features = self._build_ml_features((gx, gy), self._last_head_pose_for_ml)
+            if features is not None:
+                pred = self.predict_ml_gaze(features)
+                if pred is not None:
+                    self._last_good_gaze = pred
+                    return pred
 
         if self._calib_range is not None:
             gx_min, gx_max, gy_min, gy_max = self._calib_range
@@ -846,10 +1036,12 @@ class GazeTracker:
         self._gaze_window.clear()
         self._last_gaze_time = None
         self._calib_quality = {}
+        self._clear_ml_calibration()
 
     def toggle_mirror(self) -> bool:
         """Toggle mirror view and return the new state."""
         self.mirror_view = not self.mirror_view
+        self._clear_ml_calibration()
         if self._calib_range is not None or self._calib_active:
             self._calib = {}
             self._calib_range = None

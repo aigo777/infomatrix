@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 a=0
 import os
+import re
 import time
 from collections import deque
 import math
@@ -32,8 +33,23 @@ def main() -> None:
     calib_path = os.path.join(calib_dir, "calibration_data.json")
     os.makedirs(calib_dir, exist_ok=True)
 
+    try:
+        user_id = os.getlogin()
+    except OSError:
+        user_id = os.environ.get("USERNAME", "default")
+    user_id = user_id or "default"
+    user_id_safe = re.sub(r"[^A-Za-z0-9_.-]", "_", user_id) or "default"
+    ml_model_filename = f"ml_model_{user_id_safe}.npz"
+    ml_model_path = os.path.join(calib_dir, ml_model_filename)
+
     if tracker.load_calibration(calib_path):
         print(f"Loaded calibration from {calib_path}")
+        if not tracker.is_ml_ready() and os.path.exists(ml_model_path):
+            tracker.load_ml_model(ml_model_path, user_id=user_id)
+        print(f"ML mapper: {'ON' if tracker.is_ml_ready() else 'OFF'}")
+    elif os.path.exists(ml_model_path):
+        if tracker.load_ml_model(ml_model_path, user_id=user_id):
+            print(f"Loaded standalone ML model from {ml_model_path}")
 
     calib_targets = [
         ("tl", "TOP-LEFT", (0.08, 0.08)),
@@ -49,6 +65,25 @@ def main() -> None:
     calib_active = False
     calib_phase = "idle"
     calib_index = 0
+    pursuit_duration_s = 10.0
+    pursuit_sample_interval_s = 0.05
+    static_ml_sample_interval_s = 0.20
+    pursuit_start_time = 0.0
+    last_pursuit_sample_time = 0.0
+    last_static_ml_sample_time = 0.0
+    pursuit_target_xy: tuple[float, float] | None = None
+    pursuit_points = [
+        (0.08, 0.08),
+        (0.50, 0.08),
+        (0.92, 0.08),
+        (0.92, 0.50),
+        (0.92, 0.92),
+        (0.50, 0.92),
+        (0.08, 0.92),
+        (0.08, 0.50),
+        (0.50, 0.50),
+        (0.08, 0.08),
+    ]
     calib_samples: list[tuple[float, float, float]] = []
     calib_data: dict[str, tuple[float, float]] = {}
     calib_quality: dict[str, dict[str, float]] = {}
@@ -186,6 +221,50 @@ def main() -> None:
             #gy = clamp01(0.5 + (gy - 0.5) * precision_gain)
         return gx, gy
 
+    def parse_pose_features(pose: object) -> tuple[float, float, float, float] | None:
+        if not isinstance(pose, dict):
+            return None
+        try:
+            yaw = float(pose.get("yaw", 0.0))
+            pitch = float(pose.get("pitch", 0.0))
+            roll = float(pose.get("roll", 0.0))
+            tz = float(pose.get("tz", 0.0))
+        except (TypeError, ValueError):
+            return None
+        if not np.isfinite([yaw, pitch, roll, tz]).all():
+            return None
+        return yaw, pitch, roll, tz
+
+    def append_ml_sample(
+        gaze_raw_sample: object,
+        pose_sample: object,
+        target_xy: tuple[float, float],
+    ) -> bool:
+        if not isinstance(gaze_raw_sample, tuple):
+            return False
+        pose_vals = parse_pose_features(pose_sample)
+        if pose_vals is None:
+            return False
+        gaze_ax = tracker.apply_axis_flip((float(gaze_raw_sample[0]), float(gaze_raw_sample[1])))
+        feat = [float(gaze_ax[0]), float(gaze_ax[1]), pose_vals[0], pose_vals[1], pose_vals[2], pose_vals[3]]
+        if not np.isfinite(feat).all():
+            return False
+        train_X.append(feat)
+        train_Y.append([float(target_xy[0]), float(target_xy[1])])
+        return True
+
+    def pursuit_target_at(elapsed_s: float) -> tuple[float, float]:
+        if elapsed_s <= 0.0:
+            return pursuit_points[0]
+        t = float(np.clip(elapsed_s / pursuit_duration_s, 0.0, 1.0))
+        seg_count = len(pursuit_points) - 1
+        pos = t * seg_count
+        seg_idx = min(int(pos), seg_count - 1)
+        frac = pos - seg_idx
+        x0, y0 = pursuit_points[seg_idx]
+        x1, y1 = pursuit_points[seg_idx + 1]
+        return float(x0 + (x1 - x0) * frac), float(y0 + (y1 - y0) * frac)
+
     def get_cursor_pos() -> tuple[int, int]:
         pt = wintypes.POINT()
         user32.GetCursorPos(ctypes.byref(pt))
@@ -255,17 +334,21 @@ def main() -> None:
                 print("Mouse control auto-disabled (face lost).")
 
         if calib_active:
-            if calib_index >= len(calib_targets):
-                calib_active = False
-                calib_phase = "idle"
-            else:
-                if calib_phase == "settle":
-                    if time.time() - calib_phase_start >= calib_settle_s:
-                        calib_phase = "capture"
-                        calib_samples = []
-                elif calib_phase == "capture":
+            if calib_phase == "settle":
+                if now - calib_phase_start >= calib_settle_s:
+                    calib_phase = "capture"
+                    calib_samples = []
+                    last_static_ml_sample_time = 0.0
+            elif calib_phase == "capture":
+                if calib_index >= len(calib_targets):
+                    calib_phase = "fit"
+                else:
+                    target_xy = calib_targets[calib_index][2]
                     if face_detected and isinstance(gaze_raw, tuple) and isinstance(eye_open, float):
                         calib_samples.append((gaze_raw[0], gaze_raw[1], eye_open))
+                        if last_static_ml_sample_time == 0.0 or now - last_static_ml_sample_time >= static_ml_sample_interval_s:
+                            if append_ml_sample(gaze_raw, head_pose, target_xy):
+                                last_static_ml_sample_time = now
                     if len(calib_samples) >= calib_samples_needed:
                         gaze_only = [(s[0], s[1]) for s in calib_samples]
                         opens = [s[2] for s in calib_samples]
@@ -274,31 +357,12 @@ def main() -> None:
                         if max(mad[0], mad[1]) > calib_mad_thresh:
                             print(f"Calibration point unstable ({calib_targets[calib_index][1]}), retrying.")
                             calib_phase = "settle"
-                            calib_phase_start = time.time()
+                            calib_phase_start = now
                             calib_samples = []
                             continue
+
                         name = calib_targets[calib_index][0]
                         calib_data[name] = (float(med[0]), float(med[1]))
-                        target_xy = calib_targets[calib_index][2]
-                        if isinstance(head_pose, dict):
-                            try:
-                                yaw = float(head_pose.get("yaw", 0.0))
-                                pitch = float(head_pose.get("pitch", 0.0))
-                                roll = float(head_pose.get("roll", 0.0))
-                                tz = float(head_pose.get("tz", 0.0))
-                                if not np.isfinite([yaw, pitch, roll, tz]).all():
-                                    yaw = pitch = roll = tz = None
-                            except (TypeError, ValueError):
-                                yaw = pitch = roll = tz = None
-                        else:
-                            yaw = pitch = roll = tz = None
-
-                        if yaw is not None:
-                            train_X.append([float(med[0]), float(med[1]), yaw, pitch, roll, tz])
-                            train_Y.append([float(target_xy[0]), float(target_xy[1])])
-                            print(f"[ML] point {name}: X={train_X[-1]} -> Y={train_Y[-1]}")
-                        else:
-                            print(f"[ML] point {name}: pose missing, skipping ML sample")
                         calib_open[name] = open_med
                         if name == "center":
                             center_open_list = opens[:]
@@ -309,51 +373,90 @@ def main() -> None:
                             "mad_x": float(mad[0]),
                             "mad_y": float(mad[1]),
                         }
+                        # Ensure each static anchor contributes at least one ML sample.
+                        append_ml_sample((float(med[0]), float(med[1])), head_pose, target_xy)
+
                         calib_index += 1
-                        calib_phase = "settle"
-                        calib_phase_start = time.time()
                         calib_samples = []
-
-                if calib_index >= len(calib_targets):
-                    calib_active = False
-                    calib_phase = "idle"
-                    print(f"[ML] collected {len(train_X)} samples, {len(train_Y)} targets")
-                    assert len(train_X) == len(train_Y)
-                    success = tracker.set_full_calibration(calib_data, pad=calib_pad)
-                    if success:
-                        open_ref = calib_open.get("center")
-                        beta_y = 0.0
-                        if center_open_list:
-                            open_arr = np.array(center_open_list, dtype=np.float32)
-                            gy_arr = np.array(center_gy_list, dtype=np.float32)
-                            mean_open = float(np.mean(open_arr))
-                            mean_gy = float(np.mean(gy_arr))
-                            cov = float(np.mean((gy_arr - mean_gy) * (open_arr - mean_open)))
-                            var = float(np.mean((open_arr - mean_open) ** 2))
-                            if var > 1e-6:
-                                beta_y = cov / var
-                        if open_ref is not None:
-                            tracker.set_openness_compensation(open_ref, beta_y)
-                        tracker.set_calibration_quality(calib_quality)
-                        tracker.save_calibration(calib_path)
-                        top_vals = [calib_data[k][1] for k in ("tl", "t", "tr") if k in calib_data]
-                        bot_vals = [calib_data[k][1] for k in ("bl", "b", "br") if k in calib_data]
-                        top_vals = [tracker.apply_axis_flip((0.5, y))[1] for y in top_vals]
-                        bot_vals = [tracker.apply_axis_flip((0.5, y))[1] for y in bot_vals]
-                        if top_vals and bot_vals:
-                            span = abs(float(np.median(bot_vals)) - float(np.median(top_vals)))
-                            if span < 0.10:
-                                print("Vertical span too small; keep head fixed, avoid eyebrow movement; try again.")
-                                y_scale = float(np.clip(0.18 / max(span, 1e-3), 0.8, 2.5))
-                        print(f"Calibration saved to {calib_path}")
-
-                        print("gx_min:", tracker._calib_range[0], "gx_max:", tracker._calib_range[1])
-                        print("gy_min:", tracker._calib_range[2], "gy_max:", tracker._calib_range[3])
-                        print("span_x:", tracker._calib_range[1]-tracker._calib_range[0], "span_y:", tracker._calib_range[3]-tracker._calib_range[2])
-
-                        
+                        if calib_index < len(calib_targets):
+                            calib_phase = "settle"
+                            calib_phase_start = now
+                        else:
+                            success = tracker.set_full_calibration(calib_data, pad=calib_pad)
+                            if not success:
+                                print("Calibration failed: range invalid.")
+                                calib_active = False
+                                calib_phase = "idle"
+                                pursuit_target_xy = None
+                            else:
+                                open_ref = calib_open.get("center")
+                                beta_y = 0.0
+                                if center_open_list:
+                                    open_arr = np.array(center_open_list, dtype=np.float32)
+                                    gy_arr = np.array(center_gy_list, dtype=np.float32)
+                                    mean_open = float(np.mean(open_arr))
+                                    mean_gy = float(np.mean(gy_arr))
+                                    cov = float(np.mean((gy_arr - mean_gy) * (open_arr - mean_open)))
+                                    var = float(np.mean((open_arr - mean_open) ** 2))
+                                    if var > 1e-6:
+                                        beta_y = cov / var
+                                if open_ref is not None:
+                                    tracker.set_openness_compensation(open_ref, beta_y)
+                                tracker.set_calibration_quality(calib_quality)
+                                top_vals = [calib_data[k][1] for k in ("tl", "t", "tr") if k in calib_data]
+                                bot_vals = [calib_data[k][1] for k in ("bl", "b", "br") if k in calib_data]
+                                top_vals = [tracker.apply_axis_flip((0.5, y))[1] for y in top_vals]
+                                bot_vals = [tracker.apply_axis_flip((0.5, y))[1] for y in bot_vals]
+                                if top_vals and bot_vals:
+                                    span = abs(float(np.median(bot_vals)) - float(np.median(top_vals)))
+                                    if span < 0.10:
+                                        print("Vertical span too small; keep head fixed, avoid eyebrow movement; try again.")
+                                        y_scale = float(np.clip(0.18 / max(span, 1e-3), 0.8, 2.5))
+                                pursuit_start_time = now
+                                last_pursuit_sample_time = 0.0
+                                pursuit_target_xy = pursuit_points[0]
+                                calib_phase = "pursuit"
+                                print("[ML] static calibration done. Starting pursuit capture...")
+            elif calib_phase == "pursuit":
+                elapsed = now - pursuit_start_time
+                pursuit_target_xy = pursuit_target_at(elapsed)
+                if (
+                    face_detected
+                    and isinstance(gaze_raw, tuple)
+                    and (last_pursuit_sample_time == 0.0 or now - last_pursuit_sample_time >= pursuit_sample_interval_s)
+                ):
+                    if append_ml_sample(gaze_raw, head_pose, pursuit_target_xy):
+                        last_pursuit_sample_time = now
+                if elapsed >= pursuit_duration_s:
+                    calib_phase = "fit"
+            elif calib_phase == "fit":
+                print(f"[ML] fitting on {len(train_X)} samples")
+                ml_ok = tracker.fit_ml_calibration(train_X, train_Y, alpha=0.5)
+                if ml_ok:
+                    if tracker.save_ml_model(ml_model_path, user_id=user_id):
+                        print(f"[ML] model saved to {ml_model_path}")
                     else:
-                        print("Calibration failed: range invalid.")
+                        print("[ML] fit succeeded, but model file save failed.")
+                else:
+                    print("[ML] fit failed, keeping fallback calibration mapping.")
+
+                if tracker.save_calibration(calib_path):
+                    print(f"Calibration saved to {calib_path}")
+                else:
+                    print("Calibration save failed.")
+                if tracker._calib_range is not None:
+                    print("gx_min:", tracker._calib_range[0], "gx_max:", tracker._calib_range[1])
+                    print("gy_min:", tracker._calib_range[2], "gy_max:", tracker._calib_range[3])
+                    print(
+                        "span_x:",
+                        tracker._calib_range[1] - tracker._calib_range[0],
+                        "span_y:",
+                        tracker._calib_range[3] - tracker._calib_range[2],
+                    )
+                print(f"[ML] mapper status: {'ON' if tracker.is_ml_ready() else 'OFF'}")
+                calib_active = False
+                calib_phase = "idle"
+                pursuit_target_xy = None
 
         frame_times.append(now)
         fps = 0.0
@@ -363,14 +466,20 @@ def main() -> None:
 
         h, w = frame.shape[:2]
         calib_status = "FULL" if tracker.has_full_calibration() else "NONE"
-        if calib_active and calib_index < len(calib_targets):
-            target_label = calib_targets[calib_index][1]
-            if calib_phase == "settle":
-                calib_status = f"IN_PROGRESS {target_label} (settle)"
-            else:
-                calib_status = f"IN_PROGRESS {target_label} ({len(calib_samples)}/{calib_samples_needed})"
+        if calib_active:
+            if calib_phase in ("settle", "capture") and calib_index < len(calib_targets):
+                target_label = calib_targets[calib_index][1]
+                if calib_phase == "settle":
+                    calib_status = f"IN_PROGRESS {target_label} (settle)"
+                else:
+                    calib_status = f"IN_PROGRESS {target_label} ({len(calib_samples)}/{calib_samples_needed})"
+            elif calib_phase == "pursuit":
+                calib_status = "IN_PROGRESS PURSUIT"
+            elif calib_phase == "fit":
+                calib_status = "IN_PROGRESS FIT"
 
         result["calib_status"] = calib_status
+        result["ml_status"] = f"{'ON' if tracker.is_ml_ready() else 'OFF'} samples={len(train_X)}"
         result["show_pose_indices"] = show_pose_indices
         debug_frame = tracker.draw_debug(frame, result)
 
@@ -534,7 +643,7 @@ def main() -> None:
                     (255, 255, 255),
                     2,
                 )
-        elif calib_active and calib_index < len(calib_targets):
+        elif calib_active and calib_phase in ("settle", "capture") and calib_index < len(calib_targets):
             _, label, pos = calib_targets[calib_index]
             tx = int(pos[0] * (screen_w - 1))
             ty = int(pos[1] * (screen_h - 1))
@@ -549,6 +658,34 @@ def main() -> None:
                 ((screen_w - size[0]) // 2, 60),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 1.0,
+                (255, 255, 255),
+                2,
+            )
+        elif calib_active and calib_phase == "pursuit" and pursuit_target_xy is not None:
+            tx = int(pursuit_target_xy[0] * (screen_w - 1))
+            ty = int(pursuit_target_xy[1] * (screen_h - 1))
+            cv2.line(pointer_frame, (tx - 20, ty), (tx + 20, ty), (255, 255, 255), 2)
+            cv2.line(pointer_frame, (tx, ty - 20), (tx, ty + 20), (255, 255, 255), 2)
+            instruction = "FOLLOW THE TARGET"
+            size, _ = cv2.getTextSize(instruction, cv2.FONT_HERSHEY_SIMPLEX, 0.9, 2)
+            cv2.putText(
+                pointer_frame,
+                instruction,
+                ((screen_w - size[0]) // 2, 60),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.9,
+                (255, 255, 255),
+                2,
+            )
+        elif calib_active and calib_phase == "fit":
+            instruction = "FITTING ML MODEL..."
+            size, _ = cv2.getTextSize(instruction, cv2.FONT_HERSHEY_SIMPLEX, 0.9, 2)
+            cv2.putText(
+                pointer_frame,
+                instruction,
+                ((screen_w - size[0]) // 2, 60),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.9,
                 (255, 255, 255),
                 2,
             )
@@ -629,6 +766,10 @@ def main() -> None:
                 calib_phase = "settle"
                 calib_index = 0
                 calib_phase_start = time.time()
+                pursuit_start_time = 0.0
+                pursuit_target_xy = None
+                last_pursuit_sample_time = 0.0
+                last_static_ml_sample_time = 0.0
             train_X = []
             train_Y = []
             calib_samples = []
@@ -649,6 +790,10 @@ def main() -> None:
             calib_active = False
             calib_phase = "idle"
             calib_index = 0
+            pursuit_start_time = 0.0
+            pursuit_target_xy = None
+            last_pursuit_sample_time = 0.0
+            last_static_ml_sample_time = 0.0
             calib_samples = []
             calib_data = {}
             calib_quality = {}
@@ -670,6 +815,9 @@ def main() -> None:
             else:
                 if tracker.load_calibration(calib_path):
                     print(f"Loaded calibration from {calib_path}")
+                    if not tracker.is_ml_ready() and os.path.exists(ml_model_path):
+                        tracker.load_ml_model(ml_model_path, user_id=user_id)
+                    print(f"ML mapper: {'ON' if tracker.is_ml_ready() else 'OFF'}")
                 else:
                     print("Load failed: no calibration data found.")
         if key == ord("m"):
