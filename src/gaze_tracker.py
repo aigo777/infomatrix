@@ -386,14 +386,18 @@ class GazeTracker:
             calib_text = f"calib={self._calib_status_text()}"
         gain_text = f"gain=({self.gain_x:.2f},{self.gain_y:.2f})"
         alpha_text = f"alpha={self._last_alpha:.2f} cutoff={self._last_cutoff:.2f} vel={self._last_velocity:.3f}"
-        map_x_text = "map_x=None"
-        map_y_text = "map_y=None"
+        map_x_text = "map_x(stored)=None"
+        map_y_text = "map_y(stored)=None"
         spans_text = "spans=None"
-        piecewise_text = f"piecewise={'ON' if self._piecewise_ok else 'OFF'} edge=({self._edge_counter_x},{self._edge_counter_y})"
+        runtime_map_text = "runtime_map=linear_range+post_adjust"
+        piecewise_text = (
+            f"piecewise(stored)={'ON' if self._piecewise_ok else 'OFF'} "
+            f"edge=({self._edge_counter_x},{self._edge_counter_y})"
+        )
         if self._map_x is not None:
-            map_x_text = f"map_x=({self._map_x['L']:.3f},{self._map_x['C']:.3f},{self._map_x['R']:.3f})"
+            map_x_text = f"map_x(stored)=({self._map_x['L']:.3f},{self._map_x['C']:.3f},{self._map_x['R']:.3f})"
         if self._map_y is not None:
-            map_y_text = f"map_y=({self._map_y['T']:.3f},{self._map_y['C']:.3f},{self._map_y['B']:.3f})"
+            map_y_text = f"map_y(stored)=({self._map_y['T']:.3f},{self._map_y['C']:.3f},{self._map_y['B']:.3f})"
         if self._map_spans is not None:
             spans_text = (
                 f"spans=({self._map_spans['spanL']:.3f},{self._map_spans['spanR']:.3f},"
@@ -405,6 +409,7 @@ class GazeTracker:
             mirror_text,
             calib_text,
             f"{gain_text} {alpha_text}",
+            runtime_map_text,
             map_x_text,
             map_y_text,
             spans_text,
@@ -601,8 +606,22 @@ class GazeTracker:
         if not os.path.exists(path):
             return False
 
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        try:
+            if os.path.getsize(path) == 0:
+                print(f"Calibration file is empty: {path}")
+                return False
+        except OSError:
+            return False
+
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"Failed to load calibration '{path}': {e}")
+            return False
+
+        if not isinstance(data, dict):
+            return False
 
         axis_flip = data.get("axis_flip")
         if isinstance(axis_flip, dict):
@@ -704,7 +723,15 @@ class GazeTracker:
         return False
 
     def map_gaze(self, gaze_raw: Optional[Gaze]) -> Optional[Gaze]:
-        """Map raw gaze to normalized screen coordinates using calibration."""
+        """Map raw gaze to normalized screen coordinates.
+
+        Runtime mapping path is:
+        axis flip -> linear calibration range mapping -> post-map adjust.
+        If full calibration is unavailable, fallback uses center/gain with
+        deadzone + gamma, then the same post-map adjust.
+        Stored piecewise maps (map_x/map_y) are diagnostic/persisted only and
+        are not used by runtime mapping in this method.
+        """
         if gaze_raw is None:
             return None
 
@@ -715,7 +742,7 @@ class GazeTracker:
         if self._calib_range is not None:
             gx_min, gx_max, gy_min, gy_max = self._calib_range
             if gx_max - gx_min > 1e-6 and gy_max - gy_min > 1e-6:
-                # Linear, reversible mapping for calibration.
+                # Runtime mapping currently remains linear here by design.
                 gx01 = (gx - gx_min) / (gx_max - gx_min)
                 gy01 = (gy - gy_min) / (gy_max - gy_min)
                 mapped = (gx01, gy01)

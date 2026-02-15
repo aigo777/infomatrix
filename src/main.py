@@ -1,5 +1,6 @@
 ﻿from __future__ import annotations
 a=0
+import argparse
 import os
 import time
 from collections import deque
@@ -10,10 +11,36 @@ from gaze_tracker import GazeTracker
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="IrisKeys - Stage 3.0")
+    parser.add_argument(
+        "--drift",
+        choices=("off", "on"),
+        default="off",
+        help="Enable drift integrator (default: off).",
+    )
+    parser.add_argument(
+        "--drift-max",
+        type=float,
+        default=0.002,
+        help="Absolute drift cap when --drift on (default: 0.002).",
+    )
+    parser.add_argument(
+        "--os-click",
+        choices=("off", "on"),
+        default="off",
+        help="Emit OS left click on SUCCESS (default: off).",
+    )
+    args = parser.parse_args()
+    drift_enabled = args.drift == "on"
+    drift_max = float(np.clip(args.drift_max, 0.0, 0.01))
+    os_click_enabled = args.os_click == "on"
+
     print("IrisKeys - Stage 3.0")
     print(
-        "Controls: q quit | esc emergency stop | m toggle mouse | space pause | s screenshot | k calibrate | r reset | l load calibration | t test | [/] edge_gain | 9/0 y_edge_gain | i/k y_scale | o/l y_offset | y flip | ,/. spring_k"
+        "Controls: q quit | esc cancel selection | m toggle mouse | p pause | space confirm | s screenshot | k calibrate | r reset | l load calibration | t test | [/] edge_gain | 9/0 y_edge_gain | i/k y_scale | o/l y_offset | y flip | ,/. spring_k"
     )
+    print(f"Drift integrator: {'ON' if drift_enabled else 'OFF'} (max={drift_max:.4f})")
+    print(f"OS click on success: {'ON' if os_click_enabled else 'OFF'}")
 
     tracker = GazeTracker()
     cap = cv2.VideoCapture(tracker.camera_index)
@@ -27,8 +54,10 @@ def main() -> None:
     pointer_win = "IrisKeys Pointer"
     cv2.namedWindow(pointer_win, cv2.WINDOW_NORMAL)
     cv2.namedWindow(debug_win, cv2.WINDOW_NORMAL)
+    cv2.setWindowProperty(pointer_win, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
-    calib_dir = os.path.join(os.getcwd(), "calibration")
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    calib_dir = os.path.join(base_dir, "calibration")
     calib_path = os.path.join(calib_dir, "calibration_data.json")
     os.makedirs(calib_dir, exist_ok=True)
 
@@ -71,6 +100,9 @@ def main() -> None:
     vw = None
     vh = None
     cursor_backend = "ctypes"
+    user32 = None
+    MOUSEEVENTF_LEFTDOWN = 0x0002
+    MOUSEEVENTF_LEFTUP = 0x0004
 
     try:
         import ctypes
@@ -112,11 +144,42 @@ def main() -> None:
     max_accel = 9000.0
     drift_x = 0.0
     drift_y = 0.0
-    drift_max = 0.04
     y_scale = 1.35
     y_offset = 0.0
     y_flip = False
     y_edge_gain = 0.18
+
+    fixation_window_ms = 260
+    fixation_min_duration_ms = 180
+    dispersion_threshold_px = 60.0
+    dwell_ms = 700
+    off_target_cancel_ms = 150
+    armed_timeout_ms = 1200
+    success_flash_ms = 420
+    space_debounce_ms = 180
+    demo_targets_norm = [
+        ("tl", (0.22, 0.22)),
+        ("tr", (0.78, 0.22)),
+        ("center", (0.50, 0.50)),
+        ("bl", (0.22, 0.78)),
+        ("br", (0.78, 0.78)),
+    ]
+
+    interaction_state = "BROWSE"
+    success_count = 0
+    false_count = 0
+    gaze_buffer: deque[tuple[float, int, int]] = deque(maxlen=120)
+    fixation_since = None
+    current_dispersion_px = None
+    dwell_target_id = None
+    dwell_start_ts = None
+    dwell_progress = 0.0
+    armed_target_id = None
+    armed_since = None
+    off_target_since = None
+    last_space_ts = 0.0
+    success_anim_target_id = None
+    success_anim_until = 0.0
 
     print("Cursor backend: ctypes")
 
@@ -191,6 +254,30 @@ def main() -> None:
     def set_cursor_pos(x_px: int, y_px: int) -> None:
         user32.SetCursorPos(int(x_px), int(y_px))
 
+    def emit_left_click() -> None:
+        if user32 is None:
+            print("OS click unavailable: user32 not initialized.")
+            return
+        try:
+            get_cursor_pos()
+            user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+            user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+        except Exception as exc:
+            print(f"OS click failed: {exc}")
+
+    def reset_dwell() -> None:
+        nonlocal dwell_target_id, dwell_start_ts, dwell_progress
+        dwell_target_id = None
+        dwell_start_ts = None
+        dwell_progress = 0.0
+
+    def reset_armed() -> None:
+        nonlocal interaction_state, armed_target_id, armed_since, off_target_since
+        interaction_state = "BROWSE"
+        armed_target_id = None
+        armed_since = None
+        off_target_since = None
+
     frame_times = deque(maxlen=30)
 
     while True:
@@ -208,7 +295,7 @@ def main() -> None:
         gaze_pointer = tracker.get_mapped_gaze(result)
 
         if isinstance(gaze_pointer, tuple):
-            if mouse_enabled:
+            if drift_enabled and mouse_enabled:
                 drift_rate = 0.002
                 drift_x = float(
                     np.clip(drift_x + (gaze_pointer[0] - 0.5) * drift_rate, -drift_max, drift_max)
@@ -216,17 +303,25 @@ def main() -> None:
                 drift_y = float(
                     np.clip(drift_y + (gaze_pointer[1] - 0.5) * drift_rate, -drift_max, drift_max)
                 )
-            else:
+            elif drift_enabled:
                 drift_x *= 0.995
                 drift_y *= 0.995
+            else:
+                drift_x = 0.0
+                drift_y = 0.0
+        elif not drift_enabled:
+            drift_x = 0.0
+            drift_y = 0.0
 
         display_gaze = None
         target_x = None
         target_y = None
         if isinstance(gaze_pointer, tuple) and vw is not None and vh is not None:
             display_gaze = transform_gaze(gaze_pointer)
-            dx = clamp01(display_gaze[0] + drift_x)
-            dy = clamp01(display_gaze[1] + drift_y)
+            dx_off = drift_x if drift_enabled else 0.0
+            dy_off = drift_y if drift_enabled else 0.0
+            dx = clamp01(display_gaze[0] + dx_off)
+            dy = clamp01(display_gaze[1] + dy_off)
             target_x = vx + int(dx * (vw - 1))
             target_y = vy + int(dy * (vh - 1))
 
@@ -324,6 +419,147 @@ def main() -> None:
                     else:
                         print("Calibration failed: range invalid.")
 
+        gaze_px = None
+        if isinstance(display_gaze, tuple) and screen_w is not None and screen_h is not None:
+            gaze_px = (
+                int(np.clip(display_gaze[0], 0.0, 1.0) * (screen_w - 1)),
+                int(np.clip(display_gaze[1], 0.0, 1.0) * (screen_h - 1)),
+            )
+
+        demo_targets = []
+        demo_targets_by_id = {}
+        if screen_w is not None and screen_h is not None:
+            demo_radius = max(48, int(min(screen_w, screen_h) * 0.075))
+            for target_id, (nx, ny) in demo_targets_norm:
+                cx = int(nx * (screen_w - 1))
+                cy = int(ny * (screen_h - 1))
+                target = {"id": target_id, "cx": cx, "cy": cy, "r": demo_radius}
+                demo_targets.append(target)
+                demo_targets_by_id[target_id] = target
+
+        hover_target_id = None
+        if isinstance(gaze_px, tuple):
+            gx_px, gy_px = gaze_px
+            for target in demo_targets:
+                if math.hypot(gx_px - target["cx"], gy_px - target["cy"]) <= target["r"]:
+                    hover_target_id = target["id"]
+                    break
+
+        tracking_ok = (
+            isinstance(gaze_px, tuple)
+            and face_detected
+            and tracker.has_full_calibration()
+            and not calib_active
+            and not mouse_paused
+        )
+        fixation_true = False
+        if tracking_ok and isinstance(gaze_px, tuple):
+            gaze_buffer.append((now, gaze_px[0], gaze_px[1]))
+            while gaze_buffer and (now - gaze_buffer[0][0]) * 1000.0 > fixation_window_ms:
+                gaze_buffer.popleft()
+
+            if len(gaze_buffer) >= 2:
+                xs = [p[1] for p in gaze_buffer]
+                ys = [p[2] for p in gaze_buffer]
+                current_dispersion_px = float(math.hypot(max(xs) - min(xs), max(ys) - min(ys)))
+                if current_dispersion_px <= dispersion_threshold_px:
+                    if fixation_since is None:
+                        fixation_since = now
+                else:
+                    fixation_since = None
+            else:
+                current_dispersion_px = 0.0
+                fixation_since = None
+            fixation_true = (
+                fixation_since is not None
+                and (now - fixation_since) * 1000.0 >= fixation_min_duration_ms
+            )
+        else:
+            gaze_buffer.clear()
+            fixation_since = None
+            current_dispersion_px = None
+            if interaction_state == "BROWSE":
+                reset_dwell()
+
+        key = cv2.waitKey(1) & 0xFF
+        now_ms = now * 1000.0
+        space_rising = False
+        if key == ord(" ") and now_ms - last_space_ts >= space_debounce_ms:
+            space_rising = True
+            last_space_ts = now_ms
+        esc_pressed = key == 27
+
+        if interaction_state == "BROWSE":
+            if tracking_ok and fixation_true and hover_target_id is not None:
+                if dwell_target_id != hover_target_id or dwell_start_ts is None:
+                    dwell_target_id = hover_target_id
+                    dwell_start_ts = now
+                    dwell_progress = 0.0
+                else:
+                    dwell_progress = float(np.clip((now - dwell_start_ts) * 1000.0 / dwell_ms, 0.0, 1.0))
+                if dwell_progress >= 1.0:
+                    interaction_state = "ARMED"
+                    armed_target_id = hover_target_id
+                    armed_since = now
+                    off_target_since = None
+                    reset_dwell()
+            else:
+                reset_dwell()
+
+            if space_rising:
+                false_count += 1
+                print(
+                    f"[{time.strftime('%H:%M:%S')}] FALSE_SELECT reason=space_in_browse "
+                    f"success={success_count} false={false_count}"
+                )
+
+            if esc_pressed:
+                reset_dwell()
+        elif interaction_state == "ARMED":
+            on_armed_target = armed_target_id is not None and hover_target_id == armed_target_id
+            if esc_pressed:
+                print(f"[{time.strftime('%H:%M:%S')}] CANCEL reason=esc")
+                reset_armed()
+                reset_dwell()
+            elif space_rising:
+                if on_armed_target and armed_target_id is not None:
+                    selected_target = armed_target_id
+                    success_count += 1
+                    success_anim_target_id = selected_target
+                    success_anim_until = now + success_flash_ms / 1000.0
+                    print(
+                        f"[{time.strftime('%H:%M:%S')}] SUCCESS target={selected_target} "
+                        f"success={success_count} false={false_count}"
+                    )
+                    if os_click_enabled:
+                        emit_left_click()
+                else:
+                    false_count += 1
+                    print(
+                        f"[{time.strftime('%H:%M:%S')}] FALSE_SELECT reason=space_off_target "
+                        f"success={success_count} false={false_count}"
+                    )
+                reset_armed()
+                reset_dwell()
+            else:
+                cancel_reason = None
+                if armed_since is not None and (now - armed_since) * 1000.0 >= armed_timeout_ms:
+                    cancel_reason = "armed_timeout"
+                elif hover_target_id is not None and armed_target_id is not None and hover_target_id != armed_target_id:
+                    cancel_reason = "target_changed"
+                else:
+                    if on_armed_target:
+                        off_target_since = None
+                    else:
+                        if off_target_since is None:
+                            off_target_since = now
+                        elif (now - off_target_since) * 1000.0 >= off_target_cancel_ms:
+                            cancel_reason = "off_target_timeout"
+                if cancel_reason is not None:
+                    print(f"[{time.strftime('%H:%M:%S')}] CANCEL reason={cancel_reason}")
+                    reset_armed()
+                    reset_dwell()
+
         frame_times.append(now)
         fps = 0.0
         if len(frame_times) >= 2:
@@ -353,6 +589,10 @@ def main() -> None:
         )
         mouse_status = f"mouse={'ON' if mouse_enabled else 'OFF'} pause={'ON' if mouse_paused else 'OFF'}"
         backend_text = f"backend={cursor_backend} lost={lost_frames}"
+        drift_text = (
+            f"drift={'ON' if drift_enabled else 'OFF'} max={drift_max:.4f} "
+            f"({drift_x:+.4f},{drift_y:+.4f})"
+        )
         desktop_text = f"desktop=({vx},{vy},{vw},{vh}) target=({target_x},{target_y})"
         cv2.putText(
             debug_frame,
@@ -374,6 +614,15 @@ def main() -> None:
         )
         cv2.putText(
             debug_frame,
+            drift_text,
+            (10, h - 70),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (0, 255, 0),
+            2,
+        )
+        cv2.putText(
+            debug_frame,
             desktop_text,
             (10, h - 50),
             cv2.FONT_HERSHEY_SIMPLEX,
@@ -385,93 +634,113 @@ def main() -> None:
         cv2.imshow(debug_win, debug_frame)
 
         pointer_frame = np.zeros((screen_h, screen_w, 3), dtype=np.uint8)
-        if isinstance(display_gaze, tuple):
-            px = int(np.clip(display_gaze[0], 0.0, 1.0) * (screen_w - 1))
-            py = int(np.clip(display_gaze[1], 0.0, 1.0) * (screen_h - 1))
-            cv2.circle(pointer_frame, (px, py), 22, (255, 0, 0), -1)
-            label = f"{display_gaze[0]:.2f},{display_gaze[1]:.2f}"
+        interaction_visible = tracker.has_full_calibration() and not calib_active
+        if interaction_visible:
+            for target in demo_targets:
+                target_id = target["id"]
+                center = (target["cx"], target["cy"])
+                radius = target["r"]
+                fill = (36, 36, 36)
+                stroke = (150, 150, 150)
+                thickness = 2
+
+                if target_id == hover_target_id:
+                    fill = (62, 92, 136)
+                    stroke = (100, 220, 255)
+                    thickness = 3
+                if interaction_state == "ARMED" and target_id == armed_target_id:
+                    fill = (52, 130, 52)
+                    stroke = (70, 255, 150)
+                    thickness = 4
+                if success_anim_target_id == target_id and now <= success_anim_until:
+                    pulse = int((now * 14.0) % 2)
+                    fill = (52, 190, 52) if pulse == 0 else (52, 235, 52)
+                    stroke = (255, 255, 255)
+                    thickness = 5
+
+                cv2.circle(pointer_frame, center, radius, fill, -1)
+                cv2.circle(pointer_frame, center, radius, stroke, thickness)
+                cv2.putText(
+                    pointer_frame,
+                    target_id.upper(),
+                    (center[0] - radius // 3, center[1] + 8),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (255, 255, 255),
+                    2,
+                )
+
+        if interaction_state == "BROWSE" and dwell_target_id in demo_targets_by_id and dwell_progress > 0.0:
+            target = demo_targets_by_id[dwell_target_id]
+            end_angle = int(-90 + 360.0 * dwell_progress)
+            cv2.ellipse(
+                pointer_frame,
+                (target["cx"], target["cy"]),
+                (target["r"] + 14, target["r"] + 14),
+                0,
+                -90,
+                end_angle,
+                (0, 255, 255),
+                5,
+            )
+        if interaction_state == "ARMED" and armed_target_id in demo_targets_by_id:
+            target = demo_targets_by_id[armed_target_id]
+            cv2.ellipse(
+                pointer_frame,
+                (target["cx"], target["cy"]),
+                (target["r"] + 14, target["r"] + 14),
+                0,
+                0,
+                360,
+                (0, 255, 140),
+                5,
+            )
             cv2.putText(
                 pointer_frame,
-                label,
-                (min(px + 24, screen_w - 140), max(py - 24, 30)),
+                "ARMED",
+                (target["cx"] - 42, target["cy"] - target["r"] - 22),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
+                0.7,
+                (0, 255, 140),
+                2,
+            )
+        if success_anim_target_id in demo_targets_by_id and now <= success_anim_until:
+            target = demo_targets_by_id[success_anim_target_id]
+            cv2.putText(
+                pointer_frame,
+                "Selected",
+                (target["cx"] - 52, target["cy"] - target["r"] - 24),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
                 (255, 255, 255),
                 2,
             )
 
-        flip_text = f"flipX={tracker.axis_flip_x} flipY={tracker.axis_flip_y}"
-        cv2.putText(
-            pointer_frame,
-            flip_text,
-            (20, screen_h - 20),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (255, 255, 255),
-            2,
-        )
-        alpha_text = f"spring_k={spring_k:.0f} edge={edge_gain:.2f}"
-        cv2.putText(
-            pointer_frame,
-            alpha_text,
-            (screen_w - 160, screen_h - 20),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (255, 255, 255),
-            2,
-        )
-        open_val = f"{eye_open:.3f}" if isinstance(eye_open, float) else "None"
-        ref_val = f"{tracker._open_ref:.3f}" if isinstance(tracker._open_ref, float) else "None"
-        open_text = f"open={open_val} ref={ref_val} beta_y={tracker._open_beta_y:.4f}"
-        y_text = f"y_scale={y_scale:.2f} y_off={y_offset:.2f} y_edge={y_edge_gain:.2f} flip={y_flip}"
-        cv2.putText(
-            pointer_frame,
-            y_text,
-            (20, screen_h - 80),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (255, 255, 255),
-            2,
-        )
-        cv2.putText(
-            pointer_frame,
-            open_text,
-            (20, screen_h - 105),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (255, 255, 255),
-            2,
-        )
-        status_text = f"mouse={'ON' if mouse_enabled else 'OFF'} {cursor_backend}"
-        cv2.putText(
-            pointer_frame,
-            status_text,
-            (20, screen_h - 50),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (255, 255, 255),
-            2,
-        )
-        desktop_text = f"desktop=({vx},{vy},{vw},{vh})"
-        target_text = f"target=({target_x},{target_y})"
-        cv2.putText(
-            pointer_frame,
-            desktop_text,
-            (20, 30),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (255, 255, 255),
-            2,
-        )
-        cv2.putText(
-            pointer_frame,
-            target_text,
-            (20, 55),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (255, 255, 255),
-            2,
-        )
+        if isinstance(gaze_px, tuple):
+            cv2.circle(pointer_frame, gaze_px, 20, (255, 0, 0), -1)
+            cv2.circle(pointer_frame, gaze_px, 24, (255, 255, 255), 2)
+
+        dwell_pct = int(100 if interaction_state == "ARMED" else round(dwell_progress * 100.0))
+        disp_text = f"{current_dispersion_px:.1f}" if isinstance(current_dispersion_px, float) else "None"
+        hud_lines = [
+            f"state={interaction_state} hover={hover_target_id or '-'} armed={armed_target_id or '-'}",
+            f"fixation={'YES' if fixation_true else 'NO'} dispersion_px={disp_text} dwell={dwell_pct}%",
+            f"success_count={success_count} false_count={false_count} os_click={'ON' if os_click_enabled else 'OFF'}",
+            f"mouse={'ON' if mouse_enabled else 'OFF'} pause={'ON' if mouse_paused else 'OFF'}",
+            "SPACE confirm | ESC cancel | P pause | Q quit | K calibrate | M mouse",
+        ]
+        y_hud = 28
+        for line in hud_lines:
+            cv2.putText(
+                pointer_frame,
+                line,
+                (20, y_hud),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7 if y_hud == 28 else 0.62,
+                (255, 255, 255),
+                2,
+            )
+            y_hud += 28
 
         if test_active:
             elapsed = time.time() - test_start
@@ -576,12 +845,7 @@ def main() -> None:
                 print(f"Mouse control error: {exc}")
                 mouse_enabled = False
 
-        key = cv2.waitKey(1) & 0xFF
         if key == ord("q"):
-            break
-        if key == 27:
-            mouse_enabled = False
-            print("Emergency stop.")
             break
         if key == ord("s"):
             filename = time.strftime("screenshot_%Y%m%d_%H%M%S.png")
@@ -650,7 +914,7 @@ def main() -> None:
                     vx_c = 0.0
                     vy_c = 0.0
                 print(f"Mouse control {'enabled' if mouse_enabled else 'disabled'}.")
-        if key == ord(" "):
+        if key == ord("p") or key == ord("P"):
             mouse_paused = not mouse_paused
         if key == ord("["):
             edge_gain = float(np.clip(edge_gain + 0.02, 0.0, 0.5))
