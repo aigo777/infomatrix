@@ -23,6 +23,27 @@ POSE_CANDIDATE_INDICES = [
     291,    # right mouth corner
 ]
 
+POSE_LANDMARKS = {
+    "nose_tip": 4,
+    "chin": 152,
+    "l_eye_outer": 33,
+    "r_eye_outer": 263,
+    "l_mouth": 61,
+    "r_mouth": 291,
+}
+
+MODEL_POINTS_3D = np.array(
+    [
+        (0.0, 0.0, 0.0),          # Nose tip
+        (0.0, -63.6, -12.5),      # Chin
+        (-43.3, 32.7, -26.0),     # Left eye outer
+        (43.3, 32.7, -26.0),      # Right eye outer
+        (-28.9, -28.9, -24.1),    # Left mouth corner
+        (28.9, -28.9, -24.1),     # Right mouth corner
+    ],
+    dtype=np.float32,
+)
+
 
 class OneEuroFilter:
     def __init__(self, min_cutoff: float = 1.0, beta: float = 0.0, d_cutoff: float = 1.0) -> None:
@@ -115,14 +136,6 @@ class GazeTracker:
     LEFT_LOWER_LID = [145, 153]
     RIGHT_UPPER_LID = [386, 387]
     RIGHT_LOWER_LID = [374, 373]
-    POSE_LANDMARKS = {
-        "nose_tip": 4,
-        "chin": 152,
-        "l_eye_outer": 33,
-        "r_eye_outer": 263,
-        "l_mouth": 61,
-        "r_mouth": 291,
-    }
 
     CALIB_TARGETS = ("center", "tl", "tr", "br", "bl")
     PANEL_TARGETS = {
@@ -446,7 +459,7 @@ class GazeTracker:
                 pitch = float(head_pose.get("pitch", 0.0))
                 roll = float(head_pose.get("roll", 0.0))
                 tz = float(head_pose.get("tz", 0.0))
-                pose_text = f"pose ypr=({yaw:.1f},{pitch:.1f},{roll:.1f}) tz={tz:.1f}"
+                pose_text = f"yaw={yaw:.1f} pitch={pitch:.1f} roll={roll:.1f} tz={tz:.1f}"
             except (TypeError, ValueError):
                 pose_text = "pose=None"
         if self._map_x is not None:
@@ -1157,77 +1170,89 @@ class GazeTracker:
     def _norm_to_px(self, pt: Point, w: int, h: int) -> Tuple[int, int]:
         return int(pt[0] * w), int(pt[1] * h)
 
-    def _estimate_head_pose(self, points_norm: List[Point], frame_w: int, frame_h: int) -> Optional[Dict[str, object]]:
-        if not isinstance(points_norm, list):
+    def _estimate_head_pose(
+        self,
+        landmarks_norm: List[Point],
+        w: int,
+        h: int,
+    ) -> Optional[Dict[str, float]]:
+        if not isinstance(landmarks_norm, list):
             return None
-        required = list(self.POSE_LANDMARKS.values())
-        if not points_norm or max(required) >= len(points_norm):
+        required = list(POSE_LANDMARKS.values())
+        if not landmarks_norm or max(required) >= len(landmarks_norm):
             return None
 
         try:
-            image_points = np.array(
+            image_points_2d = np.array(
                 [
-                    self._norm_to_px(points_norm[self.POSE_LANDMARKS["nose_tip"]], frame_w, frame_h),
-                    self._norm_to_px(points_norm[self.POSE_LANDMARKS["chin"]], frame_w, frame_h),
-                    self._norm_to_px(points_norm[self.POSE_LANDMARKS["l_eye_outer"]], frame_w, frame_h),
-                    self._norm_to_px(points_norm[self.POSE_LANDMARKS["r_eye_outer"]], frame_w, frame_h),
-                    self._norm_to_px(points_norm[self.POSE_LANDMARKS["l_mouth"]], frame_w, frame_h),
-                    self._norm_to_px(points_norm[self.POSE_LANDMARKS["r_mouth"]], frame_w, frame_h),
+                    (landmarks_norm[POSE_LANDMARKS["nose_tip"]][0] * w, landmarks_norm[POSE_LANDMARKS["nose_tip"]][1] * h),
+                    (landmarks_norm[POSE_LANDMARKS["chin"]][0] * w, landmarks_norm[POSE_LANDMARKS["chin"]][1] * h),
+                    (landmarks_norm[POSE_LANDMARKS["l_eye_outer"]][0] * w, landmarks_norm[POSE_LANDMARKS["l_eye_outer"]][1] * h),
+                    (landmarks_norm[POSE_LANDMARKS["r_eye_outer"]][0] * w, landmarks_norm[POSE_LANDMARKS["r_eye_outer"]][1] * h),
+                    (landmarks_norm[POSE_LANDMARKS["l_mouth"]][0] * w, landmarks_norm[POSE_LANDMARKS["l_mouth"]][1] * h),
+                    (landmarks_norm[POSE_LANDMARKS["r_mouth"]][0] * w, landmarks_norm[POSE_LANDMARKS["r_mouth"]][1] * h),
                 ],
                 dtype=np.float32,
             )
         except (TypeError, ValueError, IndexError):
             return None
 
-        model_points = np.array(
-            [
-                (0.0, 0.0, 0.0),
-                (0.0, -63.6, -12.5),
-                (-43.3, 32.7, -26.0),
-                (43.3, 32.7, -26.0),
-                (-28.9, -28.9, -24.1),
-                (28.9, -28.9, -24.1),
-            ],
-            dtype=np.float32,
-        )
-        f = float(frame_w)
-        cx = float(frame_w) * 0.5
-        cy = float(frame_h) * 0.5
+        fx = float(w)
+        fy = float(w)
+        cx = float(w) * 0.5
+        cy = float(h) * 0.5
         camera_matrix = np.array(
             [
-                [f, 0.0, cx],
-                [0.0, f, cy],
+                [fx, 0.0, cx],
+                [0.0, fy, cy],
                 [0.0, 0.0, 1.0],
             ],
             dtype=np.float32,
         )
         dist_coeffs = np.zeros((4, 1), dtype=np.float32)
 
-        success, rvec, tvec = cv2.solvePnP(
-            model_points,
-            image_points,
-            camera_matrix,
-            dist_coeffs,
-            flags=cv2.SOLVEPNP_ITERATIVE,
-        )
+        try:
+            success, rvec, tvec = cv2.solvePnP(
+                MODEL_POINTS_3D,
+                image_points_2d,
+                camera_matrix,
+                dist_coeffs,
+                flags=cv2.SOLVEPNP_ITERATIVE,
+            )
+        except cv2.error:
+            return None
         if not success:
             return None
 
-        rot_matrix, _ = cv2.Rodrigues(rvec)
-        pitch_deg, yaw_deg, roll_deg = self._rotationMatrixToEulerAngles(rot_matrix)
-        tvec_flat = tvec.reshape(-1)
-        if tvec_flat.size < 3:
+        try:
+            rot_matrix, _ = cv2.Rodrigues(rvec)
+        except cv2.error:
             return None
+        if not np.isfinite(rot_matrix).all() or not np.isfinite(tvec).all():
+            return None
+
+        try:
+            yaw_deg, pitch_deg, roll_deg = self._rotationMatrixToEulerAngles(rot_matrix)
+        except (ValueError, OverflowError):
+            return None
+        if not np.isfinite([yaw_deg, pitch_deg, roll_deg]).all():
+            return None
+
+        tvec_flat = tvec.reshape(-1)
+        if tvec_flat.size < 3 or not np.isfinite(tvec_flat[2]):
+            return None
+
         return {
             "yaw": float(yaw_deg),
             "pitch": float(pitch_deg),
             "roll": float(roll_deg),
             "tz": float(tvec_flat[2]),
-            "rvec": [float(x) for x in rvec.reshape(-1)],
-            "tvec": [float(x) for x in tvec_flat],
         }
 
     def _rotationMatrixToEulerAngles(self, rotation_matrix: np.ndarray) -> Tuple[float, float, float]:
+        if rotation_matrix.shape != (3, 3):
+            raise ValueError("Rotation matrix must be 3x3.")
+
         sy = math.sqrt(rotation_matrix[0, 0] * rotation_matrix[0, 0] + rotation_matrix[1, 0] * rotation_matrix[1, 0])
         singular = sy < 1e-6
 
@@ -1240,7 +1265,7 @@ class GazeTracker:
             yaw = math.atan2(-rotation_matrix[2, 0], sy)
             roll = 0.0
 
-        return math.degrees(pitch), math.degrees(yaw), math.degrees(roll)
+        return math.degrees(yaw), math.degrees(pitch), math.degrees(roll)
 
     def _format_gaze_text(self, label: str, gaze: Optional[Gaze]) -> str:
         if isinstance(gaze, tuple):
