@@ -61,6 +61,22 @@ class DemoUiBehaviorTests(unittest.TestCase):
         demo.update(1000, (0, 0), face_detected=True, raw_desktop_px=(0, 0))
         self.assertIsNone(demo.assist_px)
 
+    def test_assist_hysteresis_keeps_target_until_snap_out(self) -> None:
+        demo = DemoUI(1200, 700, assist_on=True)
+        demo.snap_in_r = 130.0
+        demo.snap_out_r = 280.0
+        cx, cy = demo.target_centers_px["C"]
+        rx, _ = demo.target_centers_px["R"]
+
+        demo.update(1000, (cx + 120, cy), face_detected=True, raw_desktop_px=(cx + 120, cy))
+        self.assertEqual(demo._snapped_id, "C")
+
+        demo.update(1033, (cx + 261, cy), face_detected=True, raw_desktop_px=(cx + 261, cy))
+        self.assertEqual(demo._snapped_id, "C")
+
+        demo.update(1066, (rx - 80, cy), face_detected=True, raw_desktop_px=(rx - 80, cy))
+        self.assertEqual(demo._snapped_id, "R")
+
 
 class DemoUiTargetsTests(unittest.TestCase):
     def test_get_targets_returns_five_unique_expected_ids(self) -> None:

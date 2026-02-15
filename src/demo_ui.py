@@ -72,6 +72,8 @@ class DemoUI:
         self.assist_p = 1.8
         self.preferred_grace_factor = 1.25
         self.preferred_release_ms = 250
+        self.snap_in_r = 0.0
+        self.snap_out_r = 0.0
 
         self._last_update_ms: Optional[int] = None
         self._fixation_buffer: Deque[Tuple[int, int, int]] = deque()
@@ -84,6 +86,7 @@ class DemoUI:
         self.assist_strength = 0.0
         self.preferred_target_id: Optional[str] = None
         self._preferred_far_since_ms: Optional[int] = None
+        self._snapped_id: Optional[str] = None
 
         self.dwell_target_id: Optional[str] = None
         self.dwell_elapsed_ms = 0.0
@@ -128,6 +131,7 @@ class DemoUI:
             self.assist_strength = 0.0
             self.preferred_target_id = None
             self._preferred_far_since_ms = None
+            self._snapped_id = None
 
     def toggle_pause(self) -> bool:
         self.paused = not self.paused
@@ -191,6 +195,8 @@ class DemoUI:
             base_assist = self._apply_assist(now_ms, safe_raw)
         else:
             self.assist_strength = 0.0
+            if safe_raw is None:
+                self._snapped_id = None
 
         if base_assist is not None:
             ax = int(round(base_assist[0] + drift_offset_px[0]))
@@ -358,6 +364,8 @@ class DemoUI:
 
     def _recompute_layout(self) -> None:
         self.target_radius = max(120, int(0.09 * min(self.screen_w, self.screen_h)))
+        self.snap_in_r = 1.05 * float(self.target_radius)
+        self.snap_out_r = 1.35 * float(self.target_radius)
         w = self.screen_w - 1
         h = self.screen_h - 1
         self.target_centers_px: Dict[str, Point] = {
@@ -420,53 +428,37 @@ class DemoUI:
     def _apply_assist(self, now_ms: int, raw_gaze_px: Point) -> Optional[Point]:
         raw_x, raw_y = raw_gaze_px
         influence_radius = self.assist_radius_factor * float(self.target_radius)
-        grace_radius = self.preferred_grace_factor * influence_radius
+        snap_in_r = max(1.0, float(self.snap_in_r))
+        snap_out_r = max(snap_in_r, float(self.snap_out_r))
 
-        nearest_id = None
-        nearest_dist = float("inf")
+        distance_by_id: Dict[str, float] = {}
         candidate_ids = []
         for tid, center in self.target_centers_px.items():
             d = math.hypot(float(raw_x - center[0]), float(raw_y - center[1]))
+            distance_by_id[tid] = d
             if d <= influence_radius:
                 candidate_ids.append((d, tid))
-            if d < nearest_dist:
-                nearest_dist = d
-                nearest_id = tid
-
-        preferred_dist = float("inf")
-        if self.preferred_target_id is not None:
-            pref_center = self.target_centers_px.get(self.preferred_target_id)
-            if pref_center is not None:
-                preferred_dist = math.hypot(float(raw_x - pref_center[0]), float(raw_y - pref_center[1]))
-                if preferred_dist > grace_radius:
-                    if self._preferred_far_since_ms is None:
-                        self._preferred_far_since_ms = now_ms
-                    elif now_ms - self._preferred_far_since_ms >= self.preferred_release_ms:
-                        self.preferred_target_id = None
-                        self._preferred_far_since_ms = None
-                else:
-                    self._preferred_far_since_ms = None
 
         chosen_id = None
         chosen_dist = float("inf")
-        if self.preferred_target_id is not None:
-            pref_center = self.target_centers_px.get(self.preferred_target_id)
-            if pref_center is not None:
-                d = math.hypot(float(raw_x - pref_center[0]), float(raw_y - pref_center[1]))
-                if d <= grace_radius:
-                    chosen_id = self.preferred_target_id
-                    chosen_dist = d
+        if self._snapped_id is not None:
+            snapped_dist = distance_by_id.get(self._snapped_id)
+            if snapped_dist is not None and snapped_dist <= snap_out_r:
+                chosen_id = self._snapped_id
+                chosen_dist = snapped_dist
+            else:
+                self._snapped_id = None
 
         if chosen_id is None and candidate_ids:
             candidate_ids.sort(key=lambda item: item[0])
-            chosen_dist, chosen_id = candidate_ids[0]
+            nearest_dist, nearest_id = candidate_ids[0]
+            if nearest_dist <= snap_in_r:
+                chosen_dist = nearest_dist
+                chosen_id = nearest_id
+                self._snapped_id = nearest_id
 
-        if chosen_id is None and nearest_id is not None and nearest_dist <= grace_radius and self.preferred_target_id == nearest_id:
-            chosen_id = nearest_id
-            chosen_dist = nearest_dist
-
-        if chosen_id is not None and self.preferred_target_id != chosen_id:
-            self.preferred_target_id = chosen_id
+        self.preferred_target_id = self._snapped_id
+        if self.preferred_target_id is None:
             self._preferred_far_since_ms = None
 
         if chosen_id is None:
