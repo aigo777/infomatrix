@@ -621,6 +621,43 @@ def main() -> None:
                 raw_desktop_px=raw_desktop_px,
             )
             demo_ui.render(pointer_frame, int(now * 1000.0))
+
+            assist_local = getattr(demo_ui, "assist_px", None)
+            assist_valid = (
+                assist_enabled
+                and demo_active
+                and isinstance(raw_local_px, tuple)
+                and isinstance(assist_local, tuple)
+                and len(assist_local) == 2
+            )
+            if assist_valid:
+                dx = float(assist_local[0] - raw_local_px[0])
+                dy = float(assist_local[1] - raw_local_px[1])
+                dist = (dx * dx + dy * dy) ** 0.5
+
+                SNAP_R = 90.0
+                if dist <= SNAP_R:
+                    ax, ay = local_to_desktop_px(
+                        (int(assist_local[0]), int(assist_local[1])),
+                        int(screen_w),
+                        int(screen_h),
+                        int(vx),
+                        int(vy),
+                        int(vw),
+                        int(vh),
+                    )
+                    target_x, target_y = int(ax), int(ay)
+
+                    cv2.circle(pointer_frame, (int(assist_local[0]), int(assist_local[1])), 6, (0, 255, 0), -1)
+                    cv2.putText(
+                        pointer_frame,
+                        f"ASSIST dist={dist:.0f}",
+                        (24, 170),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6,
+                        (0, 255, 0),
+                        2,
+                    )
         elif test_active:
             if isinstance(display_gaze, tuple):
                 px = int(np.clip(display_gaze[0], 0.0, 1.0) * (screen_w - 1))

@@ -2,12 +2,18 @@ from __future__ import annotations
 
 import math
 from collections import deque
-from typing import Deque, Dict, Optional, Tuple
+from typing import Deque, Dict, List, Optional, Tuple, TypedDict
 
 import cv2
 import numpy as np
 
 Point = Tuple[int, int]
+
+
+class Target(TypedDict):
+    id: str
+    center_px: Point
+    radius_px: int
 
 
 def normalized_to_local_px(gaze_norm: Tuple[float, float], screen_w: int, screen_h: int) -> Point:
@@ -101,6 +107,20 @@ class DemoUI:
         self.screen_w = sw
         self.screen_h = sh
         self._recompute_layout()
+
+    def get_targets(self) -> List[Target]:
+        """Return current magnetism targets in LOCAL window pixel coordinates."""
+        ordered_ids = ("C", "U", "D", "L", "R")
+        return [
+            {"id": tid, "center_px": self.target_centers_px[tid], "radius_px": self.target_radius}
+            for tid in ordered_ids
+        ]
+
+    def get_target_by_id(self, tid: str) -> Optional[Target]:
+        center = self.target_centers_px.get(tid)
+        if center is None:
+            return None
+        return {"id": tid, "center_px": center, "radius_px": self.target_radius}
 
     def set_assist_enabled(self, enabled: bool) -> None:
         self.assist_on = bool(enabled)
@@ -397,7 +417,7 @@ class DemoUI:
             and disp_y <= self.fixation_dispersion_px
         )
 
-    def _apply_assist(self, now_ms: int, raw_gaze_px: Point) -> Point:
+    def _apply_assist(self, now_ms: int, raw_gaze_px: Point) -> Optional[Point]:
         raw_x, raw_y = raw_gaze_px
         influence_radius = self.assist_radius_factor * float(self.target_radius)
         grace_radius = self.preferred_grace_factor * influence_radius
@@ -451,7 +471,7 @@ class DemoUI:
 
         if chosen_id is None:
             self.assist_strength = 0.0
-            return raw_gaze_px
+            return None
 
         center = self.target_centers_px[chosen_id]
         s = float(np.clip(1.0 - (chosen_dist / max(influence_radius, 1e-6)), 0.0, 1.0))
