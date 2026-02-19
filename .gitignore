@@ -1,0 +1,8 @@
+.venu/
+venu/
+env/
+**/.venu/
+__pycache__/
+**/__pycache__/
+*.pyc
+.vscode/

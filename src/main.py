@@ -30,10 +30,17 @@ def main() -> None:
         default="off",
         help="Emit OS left click on SUCCESS (default: off).",
     )
+    parser.add_argument(
+        "--assist",
+        choices=("off", "on"),
+        default="off",
+        help="Enable gentle assistive magnetism for demo targets (default: off).",
+    )
     args = parser.parse_args()
     drift_enabled = args.drift == "on"
     drift_max = float(np.clip(args.drift_max, 0.0, 0.01))
     os_click_enabled = args.os_click == "on"
+    assist_enabled = args.assist == "on"
 
     print("IrisKeys - Stage 3.0")
     print(
@@ -41,6 +48,7 @@ def main() -> None:
     )
     print(f"Drift integrator: {'ON' if drift_enabled else 'OFF'} (max={drift_max:.4f})")
     print(f"OS click on success: {'ON' if os_click_enabled else 'OFF'}")
+    print(f"Assist magnetism: {'ON' if assist_enabled else 'OFF'}")
 
     tracker = GazeTracker()
     cap = cv2.VideoCapture(tracker.camera_index)
@@ -157,6 +165,12 @@ def main() -> None:
     armed_timeout_ms = 1200
     success_flash_ms = 420
     space_debounce_ms = 180
+    assist_radius_factor = 1.6
+    assist_k = 0.35
+    assist_power = 2.0
+    assist_release_far_factor = 1.2
+    assist_stick_grace_ms = 180
+    assist_deadzone_strength = 0.05
     demo_targets_norm = [
         ("tl", (0.22, 0.22)),
         ("tr", (0.78, 0.22)),
@@ -180,6 +194,9 @@ def main() -> None:
     last_space_ts = 0.0
     success_anim_target_id = None
     success_anim_until = 0.0
+    preferred_target_id = None
+    preferred_far_since = None
+    assist_strength = 0.0
 
     print("Cursor backend: ctypes")
 
@@ -419,9 +436,10 @@ def main() -> None:
                     else:
                         print("Calibration failed: range invalid.")
 
-        gaze_px = None
+        raw_gaze_px = None
+        assist_px = None
         if isinstance(display_gaze, tuple) and screen_w is not None and screen_h is not None:
-            gaze_px = (
+            raw_gaze_px = (
                 int(np.clip(display_gaze[0], 0.0, 1.0) * (screen_w - 1)),
                 int(np.clip(display_gaze[1], 0.0, 1.0) * (screen_h - 1)),
             )
@@ -437,24 +455,96 @@ def main() -> None:
                 demo_targets.append(target)
                 demo_targets_by_id[target_id] = target
 
+        assist_strength = 0.0
+        if isinstance(raw_gaze_px, tuple):
+            assist_px = raw_gaze_px
+        if not assist_enabled:
+            preferred_target_id = None
+            preferred_far_since = None
+        if preferred_target_id not in demo_targets_by_id:
+            preferred_target_id = None
+            preferred_far_since = None
+
+        if assist_enabled and isinstance(raw_gaze_px, tuple) and demo_targets:
+            gx_raw, gy_raw = raw_gaze_px
+            best_id = None
+            best_score = -1e9
+            for target in demo_targets:
+                cx = target["cx"]
+                cy = target["cy"]
+                r = target["r"]
+                r_assist = assist_radius_factor * r
+                d_raw = float(math.hypot(gx_raw - cx, gy_raw - cy))
+                if d_raw > r_assist:
+                    continue
+                score = r_assist - d_raw
+                if preferred_target_id == target["id"]:
+                    score += 0.15 * r_assist
+                if interaction_state == "ARMED" and armed_target_id == target["id"]:
+                    score += 0.25 * r_assist
+                if score > best_score:
+                    best_score = score
+                    best_id = target["id"]
+
+            if preferred_target_id is None and best_id is not None:
+                preferred_target_id = best_id
+                preferred_far_since = None
+
+            if preferred_target_id is not None and preferred_target_id in demo_targets_by_id:
+                pref = demo_targets_by_id[preferred_target_id]
+                pref_r_assist = assist_radius_factor * pref["r"]
+                pref_far = assist_release_far_factor * pref_r_assist
+                d_pref = float(math.hypot(gx_raw - pref["cx"], gy_raw - pref["cy"]))
+                if d_pref > pref_far:
+                    if preferred_far_since is None:
+                        preferred_far_since = now
+                    elif (now - preferred_far_since) * 1000.0 >= assist_stick_grace_ms:
+                        preferred_target_id = None
+                        preferred_far_since = None
+                else:
+                    preferred_far_since = None
+
+            if preferred_target_id is None and best_id is not None:
+                preferred_target_id = best_id
+
+            force_id = preferred_target_id if preferred_target_id in demo_targets_by_id else best_id
+            if force_id is not None:
+                target = demo_targets_by_id[force_id]
+                cx = target["cx"]
+                cy = target["cy"]
+                r_assist = assist_radius_factor * target["r"]
+                d_raw = float(math.hypot(gx_raw - cx, gy_raw - cy))
+                u = float(np.clip(1.0 - d_raw / max(r_assist, 1e-6), 0.0, 1.0))
+                s = float(u ** assist_power)
+                if s < assist_deadzone_strength:
+                    s = 0.0
+                assist_strength = s
+                a = assist_k * s
+                ax = int(round(gx_raw + (cx - gx_raw) * a))
+                ay = int(round(gy_raw + (cy - gy_raw) * a))
+                assist_px = (
+                    int(np.clip(ax, 0, max(screen_w - 1, 0))),
+                    int(np.clip(ay, 0, max(screen_h - 1, 0))),
+                )
+
         hover_target_id = None
-        if isinstance(gaze_px, tuple):
-            gx_px, gy_px = gaze_px
+        if isinstance(assist_px, tuple):
+            gx_px, gy_px = assist_px
             for target in demo_targets:
                 if math.hypot(gx_px - target["cx"], gy_px - target["cy"]) <= target["r"]:
                     hover_target_id = target["id"]
                     break
 
         tracking_ok = (
-            isinstance(gaze_px, tuple)
+            isinstance(raw_gaze_px, tuple)
             and face_detected
             and tracker.has_full_calibration()
             and not calib_active
             and not mouse_paused
         )
         fixation_true = False
-        if tracking_ok and isinstance(gaze_px, tuple):
-            gaze_buffer.append((now, gaze_px[0], gaze_px[1]))
+        if tracking_ok and isinstance(raw_gaze_px, tuple):
+            gaze_buffer.append((now, raw_gaze_px[0], raw_gaze_px[1]))
             while gaze_buffer and (now - gaze_buffer[0][0]) * 1000.0 > fixation_window_ms:
                 gaze_buffer.popleft()
 
@@ -716,16 +806,25 @@ def main() -> None:
                 2,
             )
 
-        if isinstance(gaze_px, tuple):
-            cv2.circle(pointer_frame, gaze_px, 20, (255, 0, 0), -1)
-            cv2.circle(pointer_frame, gaze_px, 24, (255, 255, 255), 2)
+        if assist_enabled and isinstance(raw_gaze_px, tuple) and isinstance(assist_px, tuple):
+            if raw_gaze_px != assist_px:
+                cv2.line(pointer_frame, raw_gaze_px, assist_px, (120, 120, 120), 1)
+            cv2.circle(pointer_frame, raw_gaze_px, 6, (180, 180, 180), -1)
+        if isinstance(assist_px, tuple):
+            cv2.circle(pointer_frame, assist_px, 20, (255, 0, 0), -1)
+            cv2.circle(pointer_frame, assist_px, 24, (255, 255, 255), 2)
 
         dwell_pct = int(100 if interaction_state == "ARMED" else round(dwell_progress * 100.0))
         disp_text = f"{current_dispersion_px:.1f}" if isinstance(current_dispersion_px, float) else "None"
+        assist_line = (
+            f"ASSIST: {'ON' if assist_enabled else 'OFF'} "
+            f"preferred={preferred_target_id or '-'} strength={assist_strength:.2f}"
+        )
         hud_lines = [
             f"state={interaction_state} hover={hover_target_id or '-'} armed={armed_target_id or '-'}",
             f"fixation={'YES' if fixation_true else 'NO'} dispersion_px={disp_text} dwell={dwell_pct}%",
             f"success_count={success_count} false_count={false_count} os_click={'ON' if os_click_enabled else 'OFF'}",
+            assist_line,
             f"mouse={'ON' if mouse_enabled else 'OFF'} pause={'ON' if mouse_paused else 'OFF'}",
             "SPACE confirm | ESC cancel | P pause | Q quit | K calibrate | M mouse",
         ]
