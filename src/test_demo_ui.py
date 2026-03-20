@@ -56,26 +56,31 @@ class DemoUiBehaviorTests(unittest.TestCase):
         self.assertEqual(demo.raw_gaze_px, (245, 315))
         self.assertEqual(demo.assist_px, (245, 315))
 
-    def test_assist_on_sets_none_when_no_target_in_range(self) -> None:
+    def test_assist_on_falls_back_to_raw_when_no_target_in_range(self) -> None:
         demo = DemoUI(1200, 700, assist_on=True)
         demo.update(1000, (0, 0), face_detected=True, raw_desktop_px=(0, 0))
-        self.assertIsNone(demo.assist_px)
+        self.assertEqual(demo.assist_px, (0, 0))
+        self.assertEqual(demo.assist_strength, 0.0)
+        self.assertIsNone(demo.preferred_target_id)
 
-    def test_assist_hysteresis_keeps_target_until_snap_out(self) -> None:
+    def test_assist_preference_grace_then_release(self) -> None:
         demo = DemoUI(1200, 700, assist_on=True)
-        demo.snap_in_r = 130.0
-        demo.snap_out_r = 280.0
         cx, cy = demo.target_centers_px["C"]
-        rx, _ = demo.target_centers_px["R"]
+        influence = demo.assist_radius_factor * demo.target_radius
+        release = demo.preferred_grace_factor * influence
 
-        demo.update(1000, (cx + 120, cy), face_detected=True, raw_desktop_px=(cx + 120, cy))
-        self.assertEqual(demo._snapped_id, "C")
+        demo.update(1000, (cx + 40, cy), face_detected=True, raw_desktop_px=(cx + 40, cy))
+        self.assertEqual(demo.preferred_target_id, "C")
+        self.assertLess(demo.assist_px[0], cx + 40)
 
-        demo.update(1033, (cx + 261, cy), face_detected=True, raw_desktop_px=(cx + 261, cy))
-        self.assertEqual(demo._snapped_id, "C")
+        far_x = int(cx + release + 20.0)
+        far_y = int(cy + release + 20.0)
+        demo.update(1300, (far_x, far_y), face_detected=True, raw_desktop_px=(far_x, far_y))
+        self.assertEqual(demo.preferred_target_id, "C")
+        self.assertEqual(demo.assist_px, (far_x, far_y))
 
-        demo.update(1066, (rx - 80, cy), face_detected=True, raw_desktop_px=(rx - 80, cy))
-        self.assertEqual(demo._snapped_id, "R")
+        demo.update(1600, (far_x, far_y), face_detected=True, raw_desktop_px=(far_x, far_y))
+        self.assertIsNone(demo.preferred_target_id)
 
 
 class DemoUiTargetsTests(unittest.TestCase):

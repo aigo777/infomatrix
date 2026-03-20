@@ -6,6 +6,11 @@ from typing import Deque, Dict, List, Optional, Tuple, TypedDict
 
 import cv2
 import numpy as np
+from intent_predictor import (
+    MagnetismParams,
+    MagnetismState,
+    compute_magnetized_target_with_state,
+)
 
 Point = Tuple[int, int]
 
@@ -67,13 +72,13 @@ class DemoUI:
         self.armed_timeout_ms = 4000
         self.success_flash_ms = 300
 
-        self.assist_radius_factor = 2.2
-        self.assist_k = 0.35
-        self.assist_p = 1.8
-        self.preferred_grace_factor = 1.25
-        self.preferred_release_ms = 250
-        self.snap_in_r = 0.0
-        self.snap_out_r = 0.0
+        self.assist_radius_factor = 1.8
+        self.assist_k = 0.32
+        self.assist_p = 2.0
+        self.preferred_grace_factor = 1.2
+        self.preferred_release_ms = 220
+        self.speed_break_px_s = 1800.0
+        self.speed_break_hold_ms = 120
 
         self._last_update_ms: Optional[int] = None
         self._fixation_buffer: Deque[Tuple[int, int, int]] = deque()
@@ -85,8 +90,9 @@ class DemoUI:
         self.hover_target_id: Optional[str] = None
         self.assist_strength = 0.0
         self.preferred_target_id: Optional[str] = None
-        self._preferred_far_since_ms: Optional[int] = None
-        self._snapped_id: Optional[str] = None
+        self._magnetism_state = MagnetismState()
+        self._assist_prev_raw_px: Optional[Point] = None
+        self._assist_prev_ms: Optional[int] = None
 
         self.dwell_target_id: Optional[str] = None
         self.dwell_elapsed_ms = 0.0
@@ -130,8 +136,9 @@ class DemoUI:
         if not self.assist_on:
             self.assist_strength = 0.0
             self.preferred_target_id = None
-            self._preferred_far_since_ms = None
-            self._snapped_id = None
+            self._magnetism_state = MagnetismState()
+            self._assist_prev_raw_px = None
+            self._assist_prev_ms = None
 
     def toggle_pause(self) -> bool:
         self.paused = not self.paused
@@ -196,7 +203,10 @@ class DemoUI:
         else:
             self.assist_strength = 0.0
             if safe_raw is None:
-                self._snapped_id = None
+                self.preferred_target_id = None
+                self._magnetism_state = MagnetismState()
+                self._assist_prev_raw_px = None
+                self._assist_prev_ms = None
 
         if base_assist is not None:
             ax = int(round(base_assist[0] + drift_offset_px[0]))
@@ -310,6 +320,8 @@ class DemoUI:
             cv2.circle(frame, draw_assist, 24, (230, 255, 255), 2)
         if self.raw_gaze_px is not None:
             draw_raw = self._clamp_point(self.raw_gaze_px)
+            if self.assist_on and self.assist_px is not None and draw_raw != draw_assist:
+                cv2.line(frame, draw_raw, draw_assist, (110, 180, 190), 1, cv2.LINE_AA)
             cv2.circle(frame, draw_raw, 6, (155, 155, 155), -1)
 
         state_text = self.state if not self.paused else f"PAUSED/{self.state}"
@@ -364,8 +376,6 @@ class DemoUI:
 
     def _recompute_layout(self) -> None:
         self.target_radius = max(120, int(0.09 * min(self.screen_w, self.screen_h)))
-        self.snap_in_r = 1.05 * float(self.target_radius)
-        self.snap_out_r = 1.35 * float(self.target_radius)
         w = self.screen_w - 1
         h = self.screen_h - 1
         self.target_centers_px: Dict[str, Point] = {
@@ -426,55 +436,42 @@ class DemoUI:
         )
 
     def _apply_assist(self, now_ms: int, raw_gaze_px: Point) -> Optional[Point]:
-        raw_x, raw_y = raw_gaze_px
-        influence_radius = self.assist_radius_factor * float(self.target_radius)
-        snap_in_r = max(1.0, float(self.snap_in_r))
-        snap_out_r = max(snap_in_r, float(self.snap_out_r))
+        prev_raw = self._assist_prev_raw_px
+        prev_ms = self._assist_prev_ms
+        gaze_speed_px_s = 0.0
+        if prev_raw is not None and prev_ms is not None and now_ms > prev_ms:
+            dt_s = max(1e-6, float(now_ms - prev_ms) / 1000.0)
+            gaze_speed_px_s = math.hypot(
+                float(raw_gaze_px[0] - prev_raw[0]),
+                float(raw_gaze_px[1] - prev_raw[1]),
+            ) / dt_s
+        self._assist_prev_raw_px = raw_gaze_px
+        self._assist_prev_ms = int(now_ms)
 
-        distance_by_id: Dict[str, float] = {}
-        candidate_ids = []
-        for tid, center in self.target_centers_px.items():
-            d = math.hypot(float(raw_x - center[0]), float(raw_y - center[1]))
-            distance_by_id[tid] = d
-            if d <= influence_radius:
-                candidate_ids.append((d, tid))
+        if self.state == "ARMED" and self.armed_target_id is not None:
+            self._magnetism_state.preferred_target_id = self.armed_target_id
 
-        chosen_id = None
-        chosen_dist = float("inf")
-        if self._snapped_id is not None:
-            snapped_dist = distance_by_id.get(self._snapped_id)
-            if snapped_dist is not None and snapped_dist <= snap_out_r:
-                chosen_id = self._snapped_id
-                chosen_dist = snapped_dist
-            else:
-                self._snapped_id = None
-
-        if chosen_id is None and candidate_ids:
-            candidate_ids.sort(key=lambda item: item[0])
-            nearest_dist, nearest_id = candidate_ids[0]
-            if nearest_dist <= snap_in_r:
-                chosen_dist = nearest_dist
-                chosen_id = nearest_id
-                self._snapped_id = nearest_id
-
-        self.preferred_target_id = self._snapped_id
-        if self.preferred_target_id is None:
-            self._preferred_far_since_ms = None
-
-        if chosen_id is None:
-            self.assist_strength = 0.0
-            return None
-
-        center = self.target_centers_px[chosen_id]
-        s = float(np.clip(1.0 - (chosen_dist / max(influence_radius, 1e-6)), 0.0, 1.0))
-        s = s ** self.assist_p
-        if s < 0.05:
-            s = 0.0
-        self.assist_strength = s
-
-        ax = raw_x + (center[0] - raw_x) * (self.assist_k * s)
-        ay = raw_y + (center[1] - raw_y) * (self.assist_k * s)
-        return int(round(ax)), int(round(ay))
+        params = MagnetismParams(
+            assist_radius_factor=self.assist_radius_factor,
+            assist_k=self.assist_k,
+            assist_p=self.assist_p,
+            preferred_grace_factor=self.preferred_grace_factor,
+            preferred_release_ms=self.preferred_release_ms,
+            speed_break_px_s=self.speed_break_px_s,
+            speed_break_hold_ms=self.speed_break_hold_ms,
+        )
+        result = compute_magnetized_target_with_state(
+            raw_px=raw_gaze_px,
+            targets=self.get_targets(),
+            state=self._magnetism_state,
+            now_ms=now_ms,
+            gaze_speed_px_s=gaze_speed_px_s,
+            params=params,
+        )
+        self._magnetism_state = result.state
+        self.preferred_target_id = result.state.preferred_target_id
+        self.assist_strength = float(result.strength)
+        return result.target_px
 
     def _validate_local_point(self, pt: Optional[Point], require_in_bounds: bool) -> Optional[Point]:
         if pt is None:
