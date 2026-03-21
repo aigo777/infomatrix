@@ -28,7 +28,7 @@ def main() -> None:
 
     print("IrisKeys - Stage 3.0")
     print(
-        "Controls: q quit | esc cancel armed | space confirm | p pause demo | m toggle mouse | b toggle blink-click | s screenshot | k calibrate | r reset | l load calibration | t test | [/] edge_gain | 9/0 y_edge_gain | i/k y_scale | o/l y_offset | y flip | ,/. spring_k"
+        "Controls: q quit | esc cancel armed | space confirm | p pause demo | v toggle demo/keyboard | m toggle mouse | b toggle blink-click | s screenshot | k calibrate | r reset | l load calibration | t test | [/] edge_gain | 9/0 y_edge_gain | i/k y_scale | o/l y_offset | y flip | ,/. spring_k"
     )
 
     tracker = GazeTracker()
@@ -1048,6 +1048,15 @@ def main() -> None:
                     vx_c = 0.0
                     vy_c = 0.0
                 print(f"Mouse control {'enabled' if mouse_enabled else 'disabled'}.")
+        if key == ord("v"):
+            if calib_active:
+                print("Mode switch unavailable during calibration.")
+            else:
+                if app_mode == APP_MODE_DEMO:
+                    app_mode = APP_MODE_KEYBOARD
+                else:
+                    app_mode = APP_MODE_DEMO
+                print(f"Overlay mode: {app_mode}.")
         if key == ord("b"):
             blink_enabled = not blink_enabled
             blink_closed = False
