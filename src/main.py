@@ -157,6 +157,12 @@ def main() -> None:
     APP_MODE_DEMO = "demo"
     APP_MODE_KEYBOARD = "keyboard"
     app_mode = APP_MODE_DEMO
+    keyboard_page = "letters"
+    keyboard_text = ""
+    keyboard_focus_key: str | None = None
+    keyboard_focus_start: float | None = None
+    keyboard_dwell_progress = 0.0
+    keyboard_armed_key: str | None = None
 
     demo_ui: DemoUI | None = None
     demo_drift_x = 0.0
