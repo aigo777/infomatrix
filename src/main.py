@@ -120,11 +120,15 @@ def main() -> None:
     train_Y: list[list[float]] = []
     center_open_list: list[float] = []
     center_gy_list: list[float] = []
+    calib_pose_ref: tuple[float, float, float, float] | None = None
     calib_settle_s = 0.8
     calib_samples_needed = 75
     calib_phase_start = 0.0
     calib_pad = 0.03
     calib_mad_thresh = 0.015
+    calib_pose_yaw_thresh = 3.0
+    calib_pose_pitch_thresh = 3.0
+    calib_pose_roll_thresh = 4.0
     test_active = False
     test_start = 0.0
     test_duration = 1.0
@@ -441,6 +445,18 @@ def main() -> None:
             return None
         return yaw, pitch, roll, tz
 
+    def pose_is_stable_for_calibration(
+        pose_vals: tuple[float, float, float, float] | None,
+        pose_ref: tuple[float, float, float, float] | None,
+    ) -> bool:
+        if pose_vals is None or pose_ref is None:
+            return False
+        return (
+            abs(pose_vals[0] - pose_ref[0]) <= calib_pose_yaw_thresh
+            and abs(pose_vals[1] - pose_ref[1]) <= calib_pose_pitch_thresh
+            and abs(pose_vals[2] - pose_ref[2]) <= calib_pose_roll_thresh
+        )
+
     def append_ml_sample(
         gaze_raw_sample: object,
         pose_sample: object,
@@ -618,6 +634,7 @@ def main() -> None:
                 if now - calib_phase_start >= calib_settle_s:
                     calib_phase = "capture"
                     calib_samples = []
+                    calib_pose_ref = parse_pose_features(head_pose)
                     last_static_ml_sample_time = 0.0
             elif calib_phase == "capture":
                 if calib_index >= len(calib_targets):
@@ -625,10 +642,15 @@ def main() -> None:
                 else:
                     target_xy = calib_targets[calib_index][2]
                     if face_detected and isinstance(gaze_raw, tuple) and isinstance(eye_open, float):
-                        calib_samples.append((gaze_raw[0], gaze_raw[1], eye_open))
-                        if last_static_ml_sample_time == 0.0 or now - last_static_ml_sample_time >= static_ml_sample_interval_s:
-                            if append_ml_sample(gaze_raw, head_pose, target_xy):
-                                last_static_ml_sample_time = now
+                        pose_vals = parse_pose_features(head_pose)
+                        if pose_vals is not None:
+                            if calib_pose_ref is None:
+                                calib_pose_ref = pose_vals
+                            if pose_is_stable_for_calibration(pose_vals, calib_pose_ref):
+                                calib_samples.append((gaze_raw[0], gaze_raw[1], eye_open))
+                                if last_static_ml_sample_time == 0.0 or now - last_static_ml_sample_time >= static_ml_sample_interval_s:
+                                    if append_ml_sample(gaze_raw, head_pose, target_xy):
+                                        last_static_ml_sample_time = now
                     if len(calib_samples) >= calib_samples_needed:
                         gaze_only = [(s[0], s[1]) for s in calib_samples]
                         opens = [s[2] for s in calib_samples]
@@ -639,6 +661,7 @@ def main() -> None:
                             calib_phase = "settle"
                             calib_phase_start = now
                             calib_samples = []
+                            calib_pose_ref = None
                             continue
 
                         name = calib_targets[calib_index][0]
@@ -658,6 +681,7 @@ def main() -> None:
 
                         calib_index += 1
                         calib_samples = []
+                        calib_pose_ref = None
                         if calib_index < len(calib_targets):
                             calib_phase = "settle"
                             calib_phase_start = now
@@ -1329,6 +1353,7 @@ def main() -> None:
                 pursuit_target_xy = None
                 last_pursuit_sample_time = 0.0
                 last_static_ml_sample_time = 0.0
+                calib_pose_ref = None
             train_X = []
             train_Y = []
             calib_samples = []
@@ -1353,6 +1378,7 @@ def main() -> None:
             pursuit_target_xy = None
             last_pursuit_sample_time = 0.0
             last_static_ml_sample_time = 0.0
+            calib_pose_ref = None
             calib_samples = []
             calib_data = {}
             calib_quality = {}
