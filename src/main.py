@@ -172,7 +172,7 @@ def main() -> None:
     app_mode = APP_MODE_DEMO
     keyboard_page = "letters"
     keyboard_text = ""
-    keyboard_send_to_os = False
+    keyboard_send_to_os = True
     keyboard_focus_key: str | None = None
     keyboard_focus_start: float | None = None
     keyboard_dwell_progress = 0.0
@@ -281,6 +281,7 @@ def main() -> None:
             ("key_backspace", "Backspace", "action", "backspace", 2.0),
             ("key_enter", "Enter", "action", "enter", 2.0),
             ("key_demo", "Demo", "action", "demo", 1.5),
+            ("key_cursor", "Cursor", "action", "cursor", 1.5),
         ]
         total_weight = sum(item[4] for item in bottom_defs)
         bottom_gap_total = gap_x * max(0, len(bottom_defs) - 1)
@@ -486,7 +487,7 @@ def main() -> None:
             return
 
         action = key["value"]
-        if action == "demo":
+        if action in {"demo", "cursor"}:
             app_mode = APP_MODE_DEMO
             reset_keyboard_focus_state()
             return
