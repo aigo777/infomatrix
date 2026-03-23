@@ -978,52 +978,81 @@ class GazeTracker:
 
     def map_gaze(self, gaze_raw: Optional[Gaze]) -> Optional[Gaze]:
         """Map raw gaze to normalized screen coordinates using calibration."""
-        if gaze_raw is None:
-            return None
+        now = time.time()
+        mapped: Optional[Gaze] = None
 
-        if False and self._blink_freeze and self._open_ref is not None and self._last_openness is not None:
+        if gaze_raw is not None and False and self._blink_freeze and self._open_ref is not None and self._last_openness is not None:
             open_now = float(self._last_openness)
             if open_now < max(self._open_min_abs, self._open_ref * self._blink_ratio):
                 if self._last_good_gaze is not None:
+                    mapped = self._last_good_gaze
+
+        if gaze_raw is not None and mapped is None:
+            gx, gy = gaze_raw
+            # Openness is kept for diagnostics only; it does not shift gaze.
+            gx, gy = self.apply_axis_flip((gx, gy))
+
+            if self.is_ml_ready():
+                features = self._build_ml_features((gx, gy), self._last_head_pose_for_ml)
+                if features is not None:
+                    pred = self.predict_ml_gaze(features)
+                    if pred is not None:
+                        mapped = pred
+
+            if mapped is None and self._calib_range is not None:
+                if self._piecewise_ok and self._map_x is not None and self._map_y is not None:
+                    gx01 = self._map_piecewise(gx, self._map_x["L"], self._map_x["C"], self._map_x["R"])
+                    gy01 = self._map_piecewise(gy, self._map_y["T"], self._map_y["C"], self._map_y["B"])
+                    mapped = self._post_map_adjust((gx01, gy01), (gx, gy))
+
+                if mapped is None:
+                    gx_min, gx_max, gy_min, gy_max = self._calib_range
+                    if gx_max - gx_min > 1e-6 and gy_max - gy_min > 1e-6:
+                        # Linear, reversible mapping for calibration.
+                        gx01 = (gx - gx_min) / (gx_max - gx_min)
+                        gy01 = (gy - gy_min) / (gy_max - gy_min)
+                        mapped = self._post_map_adjust((gx01, gy01), (gx, gy))
+
+            if mapped is None:
+                center = self._calib_center if self._calib_center is not None else (0.5, 0.5)
+                gx01 = 0.5 + (gx - center[0]) * self.gain_x
+                gy01 = 0.5 + (gy - center[1]) * self.gain_y
+                gx01 = self._apply_deadzone(gx01)
+                gy01 = self._apply_deadzone(gy01)
+                gx01 = self._apply_gamma(gx01)
+                gy01 = self._apply_gamma(gy01)
+                mapped = self._post_map_adjust((self._clamp01(gx01), self._clamp01(gy01)), (gx, gy))
+
+        if mapped is None:
+            if self._reacquiring:
+                self._reacquire_count = 0
+                return None
+
+            if self._invalid_since is None:
+                self._invalid_since = now
+
+            if now - self._invalid_since < self._recovery_hold_s:
+                if self._last_good_gaze is not None:
                     return self._last_good_gaze
+                return None
 
-        gx, gy = gaze_raw
-        # Openness is kept for diagnostics only; it does not shift gaze.
-        gx, gy = self.apply_axis_flip((gx, gy))
+            self._last_good_gaze = None
+            self._reset_gaze_recovery_state()
+            self._reacquiring = True
+            self._reacquire_count = 0
+            return None
 
-        if self.is_ml_ready():
-            features = self._build_ml_features((gx, gy), self._last_head_pose_for_ml)
-            if features is not None:
-                pred = self.predict_ml_gaze(features)
-                if pred is not None:
-                    self._last_good_gaze = pred
-                    return pred
+        self._invalid_since = None
 
-        if self._calib_range is not None:
-            if self._piecewise_ok and self._map_x is not None and self._map_y is not None:
-                gx01 = self._map_piecewise(gx, self._map_x["L"], self._map_x["C"], self._map_x["R"])
-                gy01 = self._map_piecewise(gy, self._map_y["T"], self._map_y["C"], self._map_y["B"])
-                mapped = self._post_map_adjust((gx01, gy01), (gx, gy))
-                self._last_good_gaze = mapped
-                return mapped
+        if self._reacquiring:
+            self._reacquire_count += 1
+            if self._reacquire_count < self._reacquire_needed_frames:
+                return None
+            self._reacquiring = False
+            self._reacquire_count = 0
+        else:
+            self._reacquire_count = 0
 
-            gx_min, gx_max, gy_min, gy_max = self._calib_range
-            if gx_max - gx_min > 1e-6 and gy_max - gy_min > 1e-6:
-                # Linear, reversible mapping for calibration.
-                gx01 = (gx - gx_min) / (gx_max - gx_min)
-                gy01 = (gy - gy_min) / (gy_max - gy_min)
-                mapped = self._post_map_adjust((gx01, gy01), (gx, gy))
-                self._last_good_gaze = mapped
-                return mapped
-
-        center = self._calib_center if self._calib_center is not None else (0.5, 0.5)
-        gx01 = 0.5 + (gx - center[0]) * self.gain_x
-        gy01 = 0.5 + (gy - center[1]) * self.gain_y
-        gx01 = self._apply_deadzone(gx01)
-        gy01 = self._apply_deadzone(gy01)
-        gx01 = self._apply_gamma(gx01)
-        gy01 = self._apply_gamma(gy01)
-        mapped = self._post_map_adjust((self._clamp01(gx01), self._clamp01(gy01)), (gx, gy))
         self._last_good_gaze = mapped
         return mapped
 
