@@ -5,6 +5,22 @@ import subprocess
 import sys
 from pathlib import Path
 
+
+def _enable_windows_dpi_awareness() -> None:
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+
+        user32 = ctypes.windll.user32
+        if hasattr(user32, "SetProcessDPIAware"):
+            user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
+
+_enable_windows_dpi_awareness()
+
 try:
     from PyQt6.QtCore import Qt
     from PyQt6.QtGui import QFont
@@ -120,8 +136,8 @@ class EyeAssistLauncher(QWidget):
         title.setFont(QFont("Segoe UI", 26, self._font_bold_weight()))
 
         subtitle = QLabel(
-            "One launcher for calibration, presentation demo, and real OS control. "
-            "The tracking stack stays untouched; this UI only controls how the product starts."
+            "Launch demo or OS control with the correct finals flow: calibration starts first, then the app "
+            "transitions automatically into the requested mode without extra clicks or head movement."
         )
         subtitle.setObjectName("heroSubtitle")
         subtitle.setWordWrap(True)
@@ -178,10 +194,10 @@ class EyeAssistLauncher(QWidget):
         safety_text.setWordWrap(True)
 
         safety_steps = QLabel(
-            "Recommended sequence:\n"
-            "1. Run Calibration\n"
-            "2. Verify Demo Mode\n"
-            "3. Launch Field Conditions (OS Mode)"
+            "Finals flow:\n"
+            "1. Choose Demo Mode or OS Mode\n"
+            "2. Calibration starts automatically\n"
+            "3. Tracking continues immediately in the selected mode"
         )
         safety_steps.setObjectName("guideText")
 
@@ -197,24 +213,13 @@ class EyeAssistLauncher(QWidget):
         cards_grid.setHorizontalSpacing(16)
         cards_grid.setVerticalSpacing(16)
 
-        calibration_card = LaunchCard(
-            "warm",
-            "Run Calibration",
-            "Starts the existing 9-point flow immediately in demo mode, ready for stage setup.",
-            [
-                "Uses the current calibration pipeline without terminal arguments.",
-                "Best first step before demo or OS launch.",
-            ],
-            "Start Calibration",
-            self.launch_calibration,
-        )
         demo_card = LaunchCard(
             "cool",
             "Launch Demo Mode",
-            "Opens the isolated presentation sandbox with the current cursor, targets, magnetism, and dwell behavior.",
+            "Starts calibration first, then stays inside the presentation sandbox for rehearsal and finals.",
             [
-                "Best mode for rehearsal and finals presentation.",
-                "Keeps the visual black demo panel visible.",
+                "No extra click needed after calibration finishes.",
+                "Best mode for rehearsal and stage presentation.",
             ],
             "Open Demo",
             self.launch_demo,
@@ -222,18 +227,17 @@ class EyeAssistLauncher(QWidget):
         os_card = LaunchCard(
             "green",
             "Launch Field Conditions (OS Mode)",
-            "Runs headless and routes cursor output to the actual Windows desktop with overlay support.",
+            "Starts calibration first, then transitions directly into real Windows cursor control.",
             [
-                "Requires an existing full calibration.",
+                "Prevents baseline drift from a second launcher click.",
                 "Failsafe: F12 or ESC instantly exits control.",
             ],
             "Take Control",
             self.launch_os_mode,
         )
 
-        cards_grid.addWidget(calibration_card, 0, 0)
-        cards_grid.addWidget(demo_card, 0, 1)
-        cards_grid.addWidget(os_card, 0, 2)
+        cards_grid.addWidget(demo_card, 0, 0)
+        cards_grid.addWidget(os_card, 0, 1)
 
         footer = QLabel(
             "Backend: EyeAssist tracking + calibration + smart magnetism + dwell selection"
@@ -391,17 +395,17 @@ class EyeAssistLauncher(QWidget):
         except Exception as exc:
             QMessageBox.critical(self, APP_TITLE, f"Failed to launch {label}.\n\n{exc}")
 
-    def launch_calibration(self) -> None:
-        self._launch(self._build_backend_args("demo", auto_calibrate=True), "calibration")
-
     def launch_demo(self) -> None:
-        self._launch(self._build_backend_args("demo"), "demo mode")
+        self._launch(
+            self._build_backend_args("demo", auto_calibrate=True) + ["--post-calibration-mode", "demo"],
+            "demo mode",
+        )
 
     def launch_os_mode(self) -> None:
         answer = QMessageBox.question(
             self,
             APP_TITLE,
-            "OS Mode will control the real Windows cursor.\n\nMake sure calibration is already completed.\nUse F12 or ESC as a kill-switch.\n\nContinue?",
+            "OS Mode will start calibration first and then automatically switch into real Windows control.\n\nUse F12 or ESC as a kill-switch.\n\nContinue?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
             if QT_API == "PyQt6"
             else QMessageBox.Yes | QMessageBox.No,
@@ -409,7 +413,10 @@ class EyeAssistLauncher(QWidget):
         yes_value = QMessageBox.StandardButton.Yes if QT_API == "PyQt6" else QMessageBox.Yes
         if answer != yes_value:
             return
-        self._launch(self._build_backend_args("os"), "OS mode")
+        self._launch(
+            self._build_backend_args("demo", auto_calibrate=True) + ["--post-calibration-mode", "os"],
+            "OS mode",
+        )
 
 
 def main() -> None:

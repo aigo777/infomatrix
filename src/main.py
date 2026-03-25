@@ -15,6 +15,22 @@ from gaze_tracker import GazeTracker
 from demo_ui import DemoUI, local_to_desktop_px, normalized_to_local_px
 
 
+def _enable_windows_dpi_awareness() -> None:
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+
+        user32 = ctypes.windll.user32
+        if hasattr(user32, "SetProcessDPIAware"):
+            user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
+
+_enable_windows_dpi_awareness()
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="IrisKeys gaze demo")
     parser.add_argument("--mode", choices=("demo", "os"), default="demo")
@@ -23,12 +39,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--assist", choices=("off", "on"), default="off")
     parser.add_argument("--drift", choices=("off", "on"), default="off")
     parser.add_argument("--auto-calibrate", choices=("off", "on"), default="off")
+    parser.add_argument("--post-calibration-mode", choices=("demo", "os", "none"), default="none")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    output_mode = args.mode
+    requested_mode = args.mode
+    pending_mode_after_calibration = args.post_calibration_mode if args.post_calibration_mode != "none" else None
+    output_mode = "demo" if args.auto_calibrate == "on" else requested_mode
     show_cv_windows = output_mode == "demo"
     click_mode = args.click
     auto_calibrate = args.auto_calibrate == "on"
@@ -56,7 +75,10 @@ def main() -> None:
     pointer_win = "IrisKeys Pointer"
     overlay_script = os.path.join(os.path.dirname(__file__), "overlay.py")
     overlay_state_path = os.path.join(tempfile.gettempdir(), "eyeassist_overlay_state.json")
+    toolbar_script = os.path.join(os.path.dirname(__file__), "toolbar.py")
+    toolbar_state_path = os.path.join(tempfile.gettempdir(), "eyeassist_toolbar_state.json")
     overlay_proc = None
+    toolbar_proc = None
     if show_cv_windows:
         cv2.namedWindow(pointer_win, cv2.WINDOW_NORMAL)
         try:
@@ -86,7 +108,7 @@ def main() -> None:
     elif os.path.exists(ml_model_path):
         if tracker.load_ml_model(ml_model_path, user_id=user_id):
             print(f"Loaded standalone ML model from {ml_model_path}")
-    if output_mode == "os" and not tracker.has_full_calibration():
+    if output_mode == "os" and pending_mode_after_calibration is None and not tracker.has_full_calibration():
         print("OS mode requires an existing full calibration. Run demo mode first and calibrate.")
         cap.release()
         return
@@ -151,18 +173,32 @@ def main() -> None:
     cursor_backend = "ctypes"
     user32 = None
     wintypes = None
+    win32api = None
 
     try:
         import ctypes
         from ctypes import wintypes
 
         user32 = ctypes.windll.user32
+        try:
+            import win32api as _win32api
+
+            win32api = _win32api
+            cursor_backend = "win32api"
+        except Exception:
+            win32api = None
         screen_w = int(user32.GetSystemMetrics(0))
         screen_h = int(user32.GetSystemMetrics(1))
-        vx = int(user32.GetSystemMetrics(76))
-        vy = int(user32.GetSystemMetrics(77))
-        vw = int(user32.GetSystemMetrics(78))
-        vh = int(user32.GetSystemMetrics(79))
+        if requested_mode == "os" or pending_mode_after_calibration == "os":
+            vx = 0
+            vy = 0
+            vw = int(screen_w)
+            vh = int(screen_h)
+        else:
+            vx = int(user32.GetSystemMetrics(76))
+            vy = int(user32.GetSystemMetrics(77))
+            vw = int(user32.GetSystemMetrics(78))
+            vh = int(user32.GetSystemMetrics(79))
     except Exception:
         screen_w = None
         screen_h = None
@@ -217,7 +253,7 @@ def main() -> None:
     BASELINE_MIN = 0.10
     BASELINE_MAX = 0.65
 
-    print("Cursor backend: ctypes")
+    print(f"Cursor backend: {cursor_backend}")
 
     VK_ESCAPE = 0x1B
     VK_F12 = 0x7B
@@ -337,6 +373,9 @@ def main() -> None:
         return int(pt.x), int(pt.y)
 
     def set_cursor_pos(x_px: int, y_px: int) -> None:
+        if win32api is not None:
+            win32api.SetCursorPos((int(x_px), int(y_px)))
+            return
         if user32 is None:
             return
         user32.SetCursorPos(int(x_px), int(y_px))
@@ -388,6 +427,40 @@ def main() -> None:
         except Exception:
             pass
 
+    def write_toolbar_state(paused: bool, next_click_button: str) -> None:
+        if output_mode != "os":
+            return
+        payload = {
+            "paused": bool(paused),
+            "next_click_button": "right" if next_click_button == "right" else "left",
+        }
+        tmp_path = toolbar_state_path + ".tmp"
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle)
+            os.replace(tmp_path, toolbar_state_path)
+        except Exception:
+            pass
+
+    def read_toolbar_state() -> tuple[bool, str]:
+        if output_mode != "os":
+            return mouse_paused, "left"
+        try:
+            with open(toolbar_state_path, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except Exception:
+            return mouse_paused, "left"
+        paused = bool(payload.get("paused", False))
+        next_click_button = "right" if payload.get("next_click_button") == "right" else "left"
+        return paused, next_click_button
+
+    def consume_toolbar_click_button() -> str:
+        paused_now, next_click_button = read_toolbar_state()
+        if next_click_button == "right":
+            write_toolbar_state(paused_now, "left")
+            return "right"
+        return "left"
+
     def stop_overlay() -> None:
         nonlocal overlay_proc
         if overlay_proc is not None:
@@ -400,6 +473,21 @@ def main() -> None:
         try:
             if os.path.exists(overlay_state_path):
                 os.remove(overlay_state_path)
+        except OSError:
+            pass
+
+    def stop_toolbar() -> None:
+        nonlocal toolbar_proc
+        if toolbar_proc is not None:
+            try:
+                toolbar_proc.terminate()
+                toolbar_proc.wait(timeout=2.0)
+            except Exception:
+                pass
+            toolbar_proc = None
+        try:
+            if os.path.exists(toolbar_state_path):
+                os.remove(toolbar_state_path)
         except OSError:
             pass
 
@@ -421,6 +509,25 @@ def main() -> None:
         except Exception as exc:
             overlay_proc = None
             print(f"Overlay launch failed: {exc}")
+
+    def start_toolbar() -> None:
+        nonlocal toolbar_proc
+        if output_mode != "os" or toolbar_proc is not None or not os.path.exists(toolbar_script):
+            return
+        env = os.environ.copy()
+        src_path = os.path.dirname(__file__)
+        current_pythonpath = env.get("PYTHONPATH", "")
+        env["PYTHONPATH"] = src_path if not current_pythonpath else src_path + os.pathsep + current_pythonpath
+        write_toolbar_state(paused=False, next_click_button="left")
+        try:
+            toolbar_proc = subprocess.Popen(
+                [sys.executable, toolbar_script, "--state-file", toolbar_state_path],
+                cwd=os.path.dirname(__file__),
+                env=env,
+            )
+        except Exception as exc:
+            toolbar_proc = None
+            print(f"Toolbar launch failed: {exc}")
 
     def send_left_click() -> bool:
         if user32 is None:
@@ -466,6 +573,39 @@ def main() -> None:
                 return True
             except Exception:
                 return False
+
+    def send_right_click() -> bool:
+        if user32 is None:
+            return False
+        try:
+            user32.mouse_event(0x0008, 0, 0, 0, 0)  # RIGHTDOWN
+            user32.mouse_event(0x0010, 0, 0, 0, 0)  # RIGHTUP
+            return True
+        except Exception:
+            return False
+
+    def os_click_at(x_px: int, y_px: int, button: str = "left") -> bool:
+        if user32 is None:
+            return False
+        x0 = int(vx)
+        y0 = int(vy)
+        w_span = int(vw) if isinstance(vw, int) and vw > 0 else int(screen_w or 1)
+        h_span = int(vh) if isinstance(vh, int) and vh > 0 else int(screen_h or 1)
+        x1 = x0 + max(1, w_span) - 1
+        y1 = y0 + max(1, h_span) - 1
+        cx = int(np.clip(x_px, x0, x1))
+        cy = int(np.clip(y_px, y0, y1))
+        try:
+            set_cursor_pos(cx, cy)
+            if button == "right":
+                user32.mouse_event(0x0008, 0, 0, 0, 0)  # RIGHTDOWN
+                user32.mouse_event(0x0010, 0, 0, 0, 0)  # RIGHTUP
+            else:
+                user32.mouse_event(0x0002, 0, 0, 0, 0)  # LEFTDOWN
+                user32.mouse_event(0x0004, 0, 0, 0, 0)  # LEFTUP
+        except Exception:
+            return False
+        return True
 
     frame_times = deque(maxlen=30)
 
@@ -519,15 +659,12 @@ def main() -> None:
         )
 
     if auto_calibrate:
-        if output_mode != "demo":
-            print("Auto-calibration is only supported in demo mode.")
-            cap.release()
-            if show_cv_windows:
-                cv2.destroyAllWindows()
-            return
+        if pending_mode_after_calibration is None:
+            pending_mode_after_calibration = requested_mode
         begin_calibration()
     if output_mode == "os":
         start_overlay()
+        start_toolbar()
 
     while True:
         if global_killswitch_pressed():
@@ -583,6 +720,8 @@ def main() -> None:
             demo_ui.set_screen_size(int(screen_w), int(screen_h))
 
         now = time.time()
+        if output_mode == "os":
+            mouse_paused, _ = read_toolbar_state()
         if face_detected:
             last_face_time = now
             lost_frames = 0
@@ -721,6 +860,28 @@ def main() -> None:
                 calib_active = False
                 calib_phase = "idle"
                 pursuit_target_xy = None
+                if pending_mode_after_calibration is not None:
+                    target_mode = pending_mode_after_calibration
+                    pending_mode_after_calibration = None
+                    if target_mode == "os":
+                        output_mode = "os"
+                        show_cv_windows = False
+                        mouse_enabled = True
+                        mouse_paused = False
+                        sx = None
+                        sy = None
+                        vx_c = 0.0
+                        vy_c = 0.0
+                        cv2.destroyAllWindows()
+                        start_overlay()
+                        start_toolbar()
+                        print("Calibration complete. Switching directly to OS mode.")
+                    else:
+                        output_mode = "demo"
+                        show_cv_windows = True
+                        mouse_enabled = True
+                        mouse_paused = False
+                        print("Calibration complete. Launching demo mode.")
 
         should_update_baseline = (
             face_detected
@@ -985,16 +1146,13 @@ def main() -> None:
         if show_cv_windows and pointer_frame is not None:
             cv2.imshow(pointer_win, pointer_frame)
 
+        current_cursor_x = target_x
+        current_cursor_y = target_y
+
         magnetized_now = bool(
             assist_enabled
             and demo_ui is not None
             and getattr(demo_ui, "assist_strength", 0.0) > 0.01
-        )
-        write_overlay_state(
-            active=bool(mouse_enabled and target_x is not None and target_y is not None and face_detected),
-            x_px=target_x,
-            y_px=target_y,
-            magnetized=magnetized_now,
         )
 
         should_move = (
@@ -1034,9 +1192,18 @@ def main() -> None:
                 sx += vx_c * dt
                 sy += vy_c * dt
                 set_cursor_pos(int(round(sx)), int(round(sy)))
+                current_cursor_x = int(round(sx))
+                current_cursor_y = int(round(sy))
             except Exception as exc:
                 print(f"Mouse control error: {exc}")
                 mouse_enabled = False
+
+        write_overlay_state(
+            active=bool(mouse_enabled and not mouse_paused and current_cursor_x is not None and current_cursor_y is not None and face_detected),
+            x_px=current_cursor_x,
+            y_px=current_cursor_y,
+            magnetized=magnetized_now,
+        )
 
         can_detect_blink = (
             blink_enabled
@@ -1161,7 +1328,12 @@ def main() -> None:
                                 int(vw),
                                 int(vh),
                             )
-                            did_click = os_left_click(int(desktop_click[0]), int(desktop_click[1]))
+                            next_click_button = consume_toolbar_click_button() if output_mode == "os" else "left"
+                            did_click = os_click_at(
+                                int(desktop_click[0]),
+                                int(desktop_click[1]),
+                                button=next_click_button,
+                            )
                             if not did_click:
                                 print("OS click failed (backend unavailable).")
                 elif event.get("type") == "false_select":
@@ -1208,6 +1380,7 @@ def main() -> None:
 
     cap.release()
     stop_overlay()
+    stop_toolbar()
     if show_cv_windows:
         cv2.destroyAllWindows()
 

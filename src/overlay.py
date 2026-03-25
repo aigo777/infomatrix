@@ -6,6 +6,36 @@ import os
 import sys
 from pathlib import Path
 
+
+def _enable_windows_dpi_awareness() -> None:
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+
+        user32 = ctypes.windll.user32
+        if hasattr(user32, "SetProcessDPIAware"):
+            user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
+
+def _get_windows_desktop_rect() -> tuple[int, int, int, int]:
+    if os.name != "nt":
+        return (0, 0, 1920, 1080)
+    try:
+        import ctypes
+
+        user32 = ctypes.windll.user32
+        width = int(user32.GetSystemMetrics(0))
+        height = int(user32.GetSystemMetrics(1))
+        return (0, 0, max(1, width), max(1, height))
+    except Exception:
+        return (0, 0, 1920, 1080)
+
+
+_enable_windows_dpi_awareness()
+
 try:
     from PyQt6.QtCore import QPointF, QRect, Qt, QTimer
     from PyQt6.QtGui import QColor, QPainter, QPen
@@ -33,7 +63,7 @@ class GazeOverlay(QWidget):
         self.cursor_y = 0
         self.active = False
         self.magnetized = False
-        self.desktop_rect = (0, 0, 1920, 1080)
+        self.desktop_rect = _get_windows_desktop_rect()
         self._init_window()
 
         self.timer = QTimer(self)
