@@ -49,7 +49,7 @@ except ImportError:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="EyeAssist transparent OS overlay")
+    parser = argparse.ArgumentParser(description="IrisKeys transparent OS overlay")
     parser.add_argument("--state-file", required=True)
     return parser.parse_args()
 
@@ -160,7 +160,7 @@ class GazeOverlay(QWidget):
 def main() -> None:
     args = parse_args()
     app = QApplication(sys.argv)
-    app.setApplicationName("EyeAssistOverlay")
+    app.setApplicationName("IrisKeysOverlay")
     overlay = GazeOverlay(Path(args.state_file))
     overlay._set_geometry_from_state()
     overlay.show()

@@ -74,9 +74,9 @@ def main() -> None:
     debug_win = "IrisKeys Debug"
     pointer_win = "IrisKeys Pointer"
     overlay_script = os.path.join(os.path.dirname(__file__), "overlay.py")
-    overlay_state_path = os.path.join(tempfile.gettempdir(), "eyeassist_overlay_state.json")
+    overlay_state_path = os.path.join(tempfile.gettempdir(), "iriskeys_overlay_state.json")
     toolbar_script = os.path.join(os.path.dirname(__file__), "toolbar.py")
-    toolbar_state_path = os.path.join(tempfile.gettempdir(), "eyeassist_toolbar_state.json")
+    toolbar_state_path = os.path.join(tempfile.gettempdir(), "iriskeys_toolbar_state.json")
     overlay_proc = None
     toolbar_proc = None
     if show_cv_windows:
@@ -583,6 +583,11 @@ def main() -> None:
             return True
         except Exception:
             return False
+
+    def send_primary_click(button: str = "left") -> bool:
+        if button == "right":
+            return send_right_click()
+        return send_left_click()
 
     def os_click_at(x_px: int, y_px: int, button: str = "left") -> bool:
         if user32 is None:
@@ -1229,8 +1234,9 @@ def main() -> None:
                 duration = now - blink_down_ts
                 blink_closed = False
                 if duration >= BLINK_MIN_HOLD_S and (now - last_click_ts) >= CLICK_COOLDOWN_S:
-                    send_left_click()
-                    last_click_ts = now
+                    next_click_button = consume_toolbar_click_button() if output_mode == "os" else "left"
+                    if send_primary_click(next_click_button):
+                        last_click_ts = now
         else:
             if not mouse_enabled or mouse_paused or calib_active:
                 blink_closed = False

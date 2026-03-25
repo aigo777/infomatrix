@@ -58,7 +58,7 @@ except ImportError:
         raise SystemExit("PyQt6 or PyQt5 is required to run launcher.py") from exc
 
 
-APP_TITLE = "EyeAssist OS"
+APP_TITLE = "IrisKeys OS"
 ROOT_DIR = Path(__file__).resolve().parent.parent
 MAIN_SCRIPT = ROOT_DIR / "src" / "main.py"
 
@@ -104,7 +104,7 @@ class LaunchCard(QFrame):
         layout.addWidget(button)
 
 
-class EyeAssistLauncher(QWidget):
+class IrisKeysLauncher(QWidget):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle(APP_TITLE)
@@ -125,7 +125,7 @@ class EyeAssistLauncher(QWidget):
 
         badge_row = QHBoxLayout()
         badge_row.setSpacing(8)
-        for text in ("Finals Build", "Windows Control", "Safe F12 Exit"):
+        for text in ("Finals Build", "Hands-Free Control", "Safe F12 Exit"):
             badge = QLabel(text)
             badge.setObjectName("pill")
             badge_row.addWidget(badge)
@@ -136,8 +136,8 @@ class EyeAssistLauncher(QWidget):
         title.setFont(QFont("Segoe UI", 26, self._font_bold_weight()))
 
         subtitle = QLabel(
-            "Launch demo or OS control with the correct finals flow: calibration starts first, then the app "
-            "transitions automatically into the requested mode without extra clicks or head movement."
+            "Calibrate once, then move directly into Demo or live OS control. "
+            "The launch flow stays simple, safe, and presentation-ready."
         )
         subtitle.setObjectName("heroSubtitle")
         subtitle.setWordWrap(True)
@@ -155,7 +155,7 @@ class EyeAssistLauncher(QWidget):
         settings_layout.setContentsMargins(22, 20, 22, 20)
         settings_layout.setSpacing(12)
 
-        settings_title = QLabel("Launch Settings")
+        settings_title = QLabel("Session Settings")
         settings_title.setObjectName("sectionTitle")
 
         self.assist_checkbox = QCheckBox("Smart Magnetism Assist")
@@ -183,7 +183,7 @@ class EyeAssistLauncher(QWidget):
         safety_layout.setContentsMargins(22, 20, 22, 20)
         safety_layout.setSpacing(10)
 
-        safety_title = QLabel("Field Conditions Safety")
+        safety_title = QLabel("OS Mode Safety")
         safety_title.setObjectName("sectionTitle")
 
         safety_text = QLabel(
@@ -216,23 +216,23 @@ class EyeAssistLauncher(QWidget):
         demo_card = LaunchCard(
             "cool",
             "Launch Demo Mode",
-            "Starts calibration first, then stays inside the presentation sandbox for rehearsal and finals.",
+            "Runs the full calibration first, then keeps everything inside the presentation sandbox.",
             [
-                "No extra click needed after calibration finishes.",
-                "Best mode for rehearsal and stage presentation.",
+                "Best for rehearsal, tuning, and stage presentation.",
+                "No second click needed after calibration.",
             ],
-            "Open Demo",
+            "Start Demo",
             self.launch_demo,
         )
         os_card = LaunchCard(
             "green",
-            "Launch Field Conditions (OS Mode)",
-            "Starts calibration first, then transitions directly into real Windows cursor control.",
+            "Launch OS Mode",
+            "Runs calibration first, then transitions directly into real Windows cursor control.",
             [
-                "Prevents baseline drift from a second launcher click.",
+                "Avoids baseline drift from an extra launcher click.",
                 "Failsafe: F12 or ESC instantly exits control.",
             ],
-            "Take Control",
+            "Start OS Mode",
             self.launch_os_mode,
         )
 
@@ -240,7 +240,7 @@ class EyeAssistLauncher(QWidget):
         cards_grid.addWidget(os_card, 0, 1)
 
         footer = QLabel(
-            "Backend: EyeAssist tracking + calibration + smart magnetism + dwell selection"
+            "Backend: IrisKeys tracking, calibration, smart magnetism, and dwell selection"
         )
         footer.setObjectName("footerText")
 
@@ -252,21 +252,21 @@ class EyeAssistLauncher(QWidget):
         self.setStyleSheet(
             """
             QWidget {
-                background: #0b1016;
+                background: #091018;
                 color: #edf4fb;
                 font-family: Segoe UI;
                 font-size: 14px;
             }
             QFrame#heroCard {
                 background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
-                    stop:0 #142334, stop:0.55 #1b3041, stop:1 #0f1822);
-                border: 1px solid #28445b;
-                border-radius: 24px;
+                    stop:0 #122335, stop:0.5 #1a3044, stop:1 #0d1823);
+                border: 1px solid #2d4960;
+                border-radius: 26px;
             }
             QFrame#settingsCard, QFrame#safetyCard, QFrame#launchCard {
-                background: #131d28;
-                border: 1px solid #233444;
-                border-radius: 20px;
+                background: #111b26;
+                border: 1px solid #26394a;
+                border-radius: 22px;
             }
             QFrame#accentBar {
                 border: none;
@@ -286,11 +286,11 @@ class EyeAssistLauncher(QWidget):
                 color: #ffffff;
             }
             QLabel#heroSubtitle, QLabel#cardSubtitle, QLabel#footerText {
-                color: #b8c8d8;
+                color: #bfd0df;
             }
             QLabel#sectionTitle, QLabel#cardTitle {
                 color: #ffffff;
-                font-size: 17px;
+                font-size: 18px;
                 font-weight: 600;
             }
             QLabel#factLabel {
@@ -299,8 +299,8 @@ class EyeAssistLauncher(QWidget):
             }
             QLabel#launchHint {
                 color: #9fd0ff;
-                background: #0f1822;
-                border: 1px solid #203243;
+                background: #0d1721;
+                border: 1px solid #203545;
                 border-radius: 12px;
                 padding: 10px 12px;
             }
@@ -327,17 +327,17 @@ class EyeAssistLauncher(QWidget):
             }
             QPushButton#primaryButton {
                 background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #1e75dd, stop:1 #2c98ff);
+                    stop:0 #1f74db, stop:1 #39a0ff);
                 border: none;
-                border-radius: 14px;
-                padding: 13px 16px;
+                border-radius: 16px;
+                padding: 14px 18px;
                 color: white;
                 font-weight: 600;
-                font-size: 14px;
+                font-size: 15px;
             }
             QPushButton#primaryButton:hover {
                 background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #2b84ed, stop:1 #40a8ff);
+                    stop:0 #2a83eb, stop:1 #49b0ff);
             }
             QPushButton#primaryButton:pressed {
                 background: #1e6ece;
@@ -423,7 +423,7 @@ def main() -> None:
     app = QApplication(sys.argv)
     app.setApplicationName(APP_TITLE)
     app.setStyle("Fusion")
-    window = EyeAssistLauncher()
+    window = IrisKeysLauncher()
     window.show()
     if QT_API == "PyQt6":
         sys.exit(app.exec())

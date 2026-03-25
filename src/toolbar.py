@@ -40,43 +40,31 @@ _enable_windows_dpi_awareness()
 try:
     from PyQt6.QtCore import Qt, pyqtSignal
     from PyQt6.QtGui import QFont
-    from PyQt6.QtWidgets import (
-        QApplication,
-        QLabel,
-        QMessageBox,
-        QPushButton,
-        QVBoxLayout,
-        QWidget,
-    )
+    from PyQt6.QtWidgets import QApplication, QHBoxLayout, QLabel, QMessageBox, QPushButton, QVBoxLayout, QWidget
+
     QT_API = "PyQt6"
 except ImportError:
     from PyQt5.QtCore import Qt, pyqtSignal
     from PyQt5.QtGui import QFont
-    from PyQt5.QtWidgets import (
-        QApplication,
-        QLabel,
-        QMessageBox,
-        QPushButton,
-        QVBoxLayout,
-        QWidget,
-    )
+    from PyQt5.QtWidgets import QApplication, QHBoxLayout, QLabel, QMessageBox, QPushButton, QVBoxLayout, QWidget
+
     QT_API = "PyQt5"
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="EyeAssist floating accessibility toolbar")
+    parser = argparse.ArgumentParser(description="IrisKeys floating accessibility toolbar")
     parser.add_argument("--state-file", required=True)
-    parser.add_argument("--edge", choices=("left", "right"), default="left")
+    parser.add_argument("--dock", choices=("top", "left", "right"), default="top")
     return parser.parse_args()
 
 
 class FloatingToolbar(QWidget):
     voice_finished = pyqtSignal(str)
 
-    def __init__(self, state_file: Path, edge: str = "right") -> None:
+    def __init__(self, state_file: Path, dock: str = "top") -> None:
         super().__init__()
         self.state_file = Path(state_file)
-        self.edge = edge
+        self.dock = dock
         self.tracking_paused = False
         self.next_click_button = "left"
         self.voice_finished.connect(self._finish_voice_type)
@@ -92,74 +80,91 @@ class FloatingToolbar(QWidget):
         self.setWindowFlags(flags)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
         self.setObjectName("toolbarRoot")
-        self.setFixedWidth(132)
 
-        root = QVBoxLayout(self)
-        root.setContentsMargins(12, 12, 12, 12)
-        root.setSpacing(12)
+        root = QHBoxLayout(self)
+        root.setContentsMargins(18, 16, 18, 16)
+        root.setSpacing(14)
 
-        title = QLabel("EyeAssist")
+        title = QLabel("IrisKeys")
         title.setObjectName("titleLabel")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter if QT_API == "PyQt6" else Qt.AlignCenter)
-        title.setFont(QFont("Segoe UI", 13, self._font_bold_weight()))
+        title.setFont(QFont("Segoe UI", 16, self._font_bold_weight()))
 
-        self.keyboard_btn = self._make_button("⌨️\nKeyboard", self.open_keyboard)
-        self.voice_btn = self._make_button("🎙️\nVoice Type", self.voice_type)
-        self.right_click_btn = self._make_button("🖱️\nRight Click", self.toggle_right_click)
-        self.pause_btn = self._make_button("⏸️\nPause", self.toggle_pause)
+        subtitle = QLabel("OS toolbar")
+        subtitle.setObjectName("subtitleLabel")
+        subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter if QT_API == "PyQt6" else Qt.AlignCenter)
+
+        title_wrap = QWidget()
+        title_layout = QVBoxLayout(title_wrap)
+        title_layout.setContentsMargins(0, 0, 0, 0)
+        title_layout.setSpacing(2)
+        title_layout.addWidget(title)
+        title_layout.addWidget(subtitle)
+        title_layout.addStretch(1)
+
+        self.keyboard_btn = self._make_button("Keyboard", self.open_keyboard)
+        self.voice_btn = self._make_button("Voice Type", self.voice_type)
+        self.right_click_btn = self._make_button("Right Click", self.toggle_right_click)
+        self.pause_btn = self._make_button("Pause", self.toggle_pause)
 
         self.state_label = QLabel()
         self.state_label.setObjectName("stateLabel")
         self.state_label.setWordWrap(True)
+        self.state_label.setMinimumWidth(150)
 
-        root.addWidget(title)
+        root.addWidget(title_wrap)
         root.addWidget(self.keyboard_btn)
         root.addWidget(self.voice_btn)
         root.addWidget(self.right_click_btn)
         root.addWidget(self.pause_btn)
-        root.addStretch(1)
         root.addWidget(self.state_label)
 
         self.setStyleSheet(
             """
             QWidget#toolbarRoot {
-                background: #111a24;
-                border: 1px solid #2a3b4a;
-                border-radius: 22px;
+                background: #101923;
+                border: 1px solid #314659;
+                border-radius: 24px;
             }
             QLabel#titleLabel {
                 color: #ffffff;
-                padding: 8px 0 2px 0;
+                padding: 2px 10px 0 4px;
+            }
+            QLabel#subtitleLabel {
+                color: #8fb8d8;
+                font-size: 12px;
+                padding: 0 10px 0 4px;
             }
             QLabel#stateLabel {
-                color: #bdd0e1;
-                background: #0d141c;
-                border: 1px solid #243645;
-                border-radius: 14px;
-                padding: 10px;
+                color: #c8dceb;
+                background: #0d141d;
+                border: 1px solid #223646;
+                border-radius: 16px;
+                padding: 14px;
+                font-size: 14px;
             }
             QPushButton {
-                min-width: 100px;
-                min-height: 100px;
+                min-width: 124px;
+                min-height: 124px;
                 border: none;
-                border-radius: 18px;
+                border-radius: 22px;
                 color: #ffffff;
-                background: #183043;
-                font-size: 15px;
+                background: #183249;
+                font-size: 17px;
                 font-weight: 600;
-                padding: 8px;
+                padding: 12px;
             }
             QPushButton:hover {
-                background: #20425c;
+                background: #245071;
             }
             QPushButton:pressed {
-                background: #152b3b;
+                background: #143044;
             }
             QPushButton[state="armed"] {
                 background: #2f7d3e;
             }
             QPushButton[state="paused"] {
-                background: #7e5a22;
+                background: #856126;
             }
             """
         )
@@ -177,14 +182,19 @@ class FloatingToolbar(QWidget):
 
     def _dock_to_edge(self) -> None:
         vx, vy, width_px, height_px = _get_windows_desktop_rect()
-        width = 132
-        height = min(620, max(480, int(height_px * 0.72)))
-        y = vy + max(20, int((height_px - height) * 0.16))
-        if self.edge == "left":
-            x = vx + 16
+        top_margin = vy + max(18, int(height_px * 0.025))
+        side_margin = max(18, int(width_px * 0.018))
+        if self.dock == "top":
+            width = min(max(900, int(width_px * 0.62)), max(900, width_px - side_margin * 2))
+            height = 168
+            x = vx + max(side_margin, int((width_px - width) / 2))
+            y = top_margin
         else:
-            x = vx + width_px - width - 16
-        self.setGeometry(x, y, width, height)
+            width = 164
+            height = min(680, max(520, int(height_px * 0.72)))
+            x = vx + side_margin if self.dock == "left" else vx + width_px - width - side_margin
+            y = vy + max(20, int((height_px - height) * 0.16))
+        self.setGeometry(int(x), int(y), int(width), int(height))
 
     def _load_state(self) -> None:
         try:
@@ -210,12 +220,12 @@ class FloatingToolbar(QWidget):
 
     def _refresh_labels(self) -> None:
         pause_text = "Paused" if self.tracking_paused else "Tracking Live"
-        click_text = "Right Click armed" if self.next_click_button == "right" else "Left Click default"
+        click_text = "Next click: Right" if self.next_click_button == "right" else "Next click: Left"
         self.state_label.setText(f"{pause_text}\n{click_text}")
 
         self.right_click_btn.setProperty("state", "armed" if self.next_click_button == "right" else "")
         self.pause_btn.setProperty("state", "paused" if self.tracking_paused else "")
-        self.pause_btn.setText("▶️\nResume" if self.tracking_paused else "⏸️\nPause")
+        self.pause_btn.setText("Resume" if self.tracking_paused else "Pause")
         self._polish_button(self.right_click_btn)
         self._polish_button(self.pause_btn)
 
@@ -234,19 +244,41 @@ class FloatingToolbar(QWidget):
 
     def voice_type(self) -> None:
         self.voice_btn.setEnabled(False)
-        self.voice_btn.setText("🎙️\nListening…")
+        self.voice_btn.setText("Listening...")
 
         def worker() -> None:
             error_message = None
             try:
                 import pyautogui
                 import speech_recognition as sr
+                import win32clipboard
+                import win32con
 
                 recognizer = sr.Recognizer()
+                recognizer.pause_threshold = 0.55
+                recognizer.non_speaking_duration = 0.35
                 with sr.Microphone() as source:
+                    recognizer.adjust_for_ambient_noise(source, duration=0.6)
                     audio = recognizer.listen(source, timeout=5, phrase_time_limit=8)
-                text = recognizer.recognize_google(audio)
-                pyautogui.write(text, interval=0.02)
+                text = ""
+                last_error: Exception | None = None
+                for language in ("ru-RU", "ru-KZ", "en-US"):
+                    try:
+                        text = recognizer.recognize_google(audio, language=language).strip()
+                        if text:
+                            break
+                    except Exception as exc:
+                        last_error = exc
+                if not text:
+                    raise RuntimeError(str(last_error) if last_error is not None else "Speech was not recognized.")
+
+                win32clipboard.OpenClipboard()
+                try:
+                    win32clipboard.EmptyClipboard()
+                    win32clipboard.SetClipboardText(text, win32con.CF_UNICODETEXT)
+                finally:
+                    win32clipboard.CloseClipboard()
+                pyautogui.hotkey("ctrl", "v")
             except Exception as exc:  # pragma: no cover - depends on runtime devices
                 error_message = str(exc)
             self.voice_finished.emit("" if error_message is None else error_message)
@@ -255,7 +287,7 @@ class FloatingToolbar(QWidget):
 
     def _finish_voice_type(self, error_message: str) -> None:
         self.voice_btn.setEnabled(True)
-        self.voice_btn.setText("🎙️\nVoice Type")
+        self.voice_btn.setText("Voice Type")
         if error_message:
             self._show_error(
                 "Voice typing failed.\n\nMake sure microphone access, speech_recognition, and pyautogui are available.\n\n"
@@ -271,14 +303,14 @@ class FloatingToolbar(QWidget):
         self._sync_state()
 
     def _show_error(self, message: str) -> None:
-        QMessageBox.warning(self, "EyeAssist Toolbar", message)
+        QMessageBox.warning(self, "IrisKeys Toolbar", message)
 
 
 def main() -> None:
     args = parse_args()
     app = QApplication(sys.argv)
-    app.setApplicationName("EyeAssistToolbar")
-    toolbar = FloatingToolbar(Path(args.state_file), edge=args.edge)
+    app.setApplicationName("IrisKeysToolbar")
+    toolbar = FloatingToolbar(Path(args.state_file), dock=args.dock)
     toolbar.show()
     if QT_API == "PyQt6":
         sys.exit(app.exec())
