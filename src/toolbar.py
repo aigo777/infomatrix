@@ -5,6 +5,7 @@ import json
 import os
 import sys
 import threading
+import time
 from pathlib import Path
 
 
@@ -38,17 +39,22 @@ def _get_windows_desktop_rect() -> tuple[int, int, int, int]:
 _enable_windows_dpi_awareness()
 
 try:
-    from PyQt6.QtCore import Qt, pyqtSignal
+    from PyQt6.QtCore import Qt, QTimer, pyqtSignal
     from PyQt6.QtGui import QFont
     from PyQt6.QtWidgets import QApplication, QHBoxLayout, QLabel, QMessageBox, QPushButton, QVBoxLayout, QWidget
 
     QT_API = "PyQt6"
 except ImportError:
-    from PyQt5.QtCore import Qt, pyqtSignal
+    from PyQt5.QtCore import Qt, QTimer, pyqtSignal
     from PyQt5.QtGui import QFont
     from PyQt5.QtWidgets import QApplication, QHBoxLayout, QLabel, QMessageBox, QPushButton, QVBoxLayout, QWidget
 
     QT_API = "PyQt5"
+
+
+VOICE_PREPARE_DELAY_S = 4.0
+VOICE_LISTEN_TIMEOUT_S = 5
+VOICE_PHRASE_LIMIT_S = 8
 
 
 def parse_args() -> argparse.Namespace:
@@ -59,7 +65,7 @@ def parse_args() -> argparse.Namespace:
 
 
 class FloatingToolbar(QWidget):
-    voice_finished = pyqtSignal(str)
+    voice_finished = pyqtSignal(int, str)
 
     def __init__(self, state_file: Path, dock: str = "top") -> None:
         super().__init__()
@@ -67,6 +73,14 @@ class FloatingToolbar(QWidget):
         self.dock = dock
         self.tracking_paused = False
         self.next_click_button = "left"
+        self.voice_state = "idle"
+        self.voice_status_text = "Ready"
+        self.voice_prepare_deadline = 0.0
+        self.voice_previous_paused_state = False
+        self.voice_session_id = 0
+        self.voice_prepare_timer = QTimer(self)
+        self.voice_prepare_timer.setInterval(200)
+        self.voice_prepare_timer.timeout.connect(self._tick_voice_prepare)
         self.voice_finished.connect(self._finish_voice_type)
         self._build_ui()
         self._load_state()
@@ -163,6 +177,9 @@ class FloatingToolbar(QWidget):
             QPushButton[state="armed"] {
                 background: #2f7d3e;
             }
+            QPushButton[state="arming"] {
+                background: #5a4d94;
+            }
             QPushButton[state="paused"] {
                 background: #856126;
             }
@@ -221,13 +238,23 @@ class FloatingToolbar(QWidget):
     def _refresh_labels(self) -> None:
         pause_text = "Paused" if self.tracking_paused else "Tracking Live"
         click_text = "Next click: Right" if self.next_click_button == "right" else "Next click: Left"
-        self.state_label.setText(f"{pause_text}\n{click_text}")
+        self.state_label.setText(f"{pause_text}\n{click_text}\nVoice: {self.voice_status_text}")
 
         self.right_click_btn.setProperty("state", "armed" if self.next_click_button == "right" else "")
         self.pause_btn.setProperty("state", "paused" if self.tracking_paused else "")
         self.pause_btn.setText("Resume" if self.tracking_paused else "Pause")
+        self.voice_btn.setProperty("state", "arming" if self.voice_state == "prepare" else "")
+        self.voice_btn.setEnabled(self.voice_state != "listening")
+        if self.voice_state == "idle":
+            self.voice_btn.setText("Voice Type")
+        elif self.voice_state == "prepare":
+            remaining = max(1, int(self.voice_prepare_deadline - time.monotonic() + 0.999))
+            self.voice_btn.setText(f"Voice in {remaining}...\nTap to cancel")
+        else:
+            self.voice_btn.setText("Listening...")
         self._polish_button(self.right_click_btn)
         self._polish_button(self.pause_btn)
+        self._polish_button(self.voice_btn)
 
     @staticmethod
     def _polish_button(button: QPushButton) -> None:
@@ -243,8 +270,48 @@ class FloatingToolbar(QWidget):
             self._show_error(f"Failed to open On-Screen Keyboard.\n\n{exc}")
 
     def voice_type(self) -> None:
-        self.voice_btn.setEnabled(False)
-        self.voice_btn.setText("Listening...")
+        if self.voice_state == "prepare":
+            self._cancel_voice_prepare()
+            return
+        if self.voice_state != "idle":
+            return
+
+        self.voice_state = "prepare"
+        self.voice_status_text = f"Ready in {int(VOICE_PREPARE_DELAY_S)}s"
+        self.voice_prepare_deadline = time.monotonic() + VOICE_PREPARE_DELAY_S
+        self.voice_prepare_timer.start()
+        self._refresh_labels()
+
+    def _tick_voice_prepare(self) -> None:
+        if self.voice_state != "prepare":
+            self.voice_prepare_timer.stop()
+            return
+        remaining = self.voice_prepare_deadline - time.monotonic()
+        if remaining <= 0.0:
+            self.voice_prepare_timer.stop()
+            self._start_voice_listening()
+            return
+        self.voice_status_text = f"Ready in {max(1, int(remaining + 0.999))}s"
+        self._refresh_labels()
+
+    def _cancel_voice_prepare(self) -> None:
+        self.voice_prepare_timer.stop()
+        self.voice_state = "idle"
+        self.voice_status_text = "Ready"
+        self.voice_prepare_deadline = 0.0
+        self._refresh_labels()
+
+    def _start_voice_listening(self) -> None:
+        if self.voice_state != "prepare":
+            return
+        self.voice_state = "listening"
+        self.voice_prepare_deadline = 0.0
+        self.voice_previous_paused_state = bool(self.tracking_paused)
+        self.tracking_paused = True
+        self.voice_status_text = "Listening"
+        self.voice_session_id += 1
+        current_session = self.voice_session_id
+        self._sync_state()
 
         def worker() -> None:
             error_message = None
@@ -259,7 +326,11 @@ class FloatingToolbar(QWidget):
                 recognizer.non_speaking_duration = 0.35
                 with sr.Microphone() as source:
                     recognizer.adjust_for_ambient_noise(source, duration=0.6)
-                    audio = recognizer.listen(source, timeout=5, phrase_time_limit=8)
+                    audio = recognizer.listen(
+                        source,
+                        timeout=VOICE_LISTEN_TIMEOUT_S,
+                        phrase_time_limit=VOICE_PHRASE_LIMIT_S,
+                    )
                 text = ""
                 last_error: Exception | None = None
                 for language in ("ru-RU", "ru-KZ", "en-US"):
@@ -281,13 +352,17 @@ class FloatingToolbar(QWidget):
                 pyautogui.hotkey("ctrl", "v")
             except Exception as exc:  # pragma: no cover - depends on runtime devices
                 error_message = str(exc)
-            self.voice_finished.emit("" if error_message is None else error_message)
+            self.voice_finished.emit(current_session, "" if error_message is None else error_message)
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _finish_voice_type(self, error_message: str) -> None:
-        self.voice_btn.setEnabled(True)
-        self.voice_btn.setText("Voice Type")
+    def _finish_voice_type(self, session_id: int, error_message: str) -> None:
+        if session_id != self.voice_session_id or self.voice_state != "listening":
+            return
+        self.tracking_paused = bool(self.voice_previous_paused_state)
+        self.voice_state = "idle"
+        self.voice_status_text = "Ready"
+        self._sync_state()
         if error_message:
             self._show_error(
                 "Voice typing failed.\n\nMake sure microphone access, speech_recognition, and pyautogui are available.\n\n"
